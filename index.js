@@ -5,7 +5,6 @@ const Database = require("better-sqlite3");
 const { Telegraf, Markup } = require("telegraf");
 const { TelegramClient, events } = require("telegram");
 const { StringSession } = require("telegram/sessions");
-const input = require("input");
 
 const API_ID = Number(process.env.API_ID || 0);
 const API_HASH = process.env.API_HASH || "";
@@ -14,6 +13,7 @@ const ADMIN_IDS = new Set((process.env.ADMIN_IDS || "")
   .split(",").map(x => x.trim()).filter(Boolean).map(Number));
 const PORT = Number(process.env.PORT || 3000);
 const DB_PATH = process.env.DB_PATH || "cloner.db";
+const AUTH_KEY = process.env.AUTH_KEY || "";
 
 if (!API_ID || !API_HASH || !BOT_TOKEN || !ADMIN_IDS.size) {
   throw new Error("Заполни API_ID, API_HASH, BOT_TOKEN и ADMIN_IDS.");
@@ -96,8 +96,37 @@ const copied= db.prepare("SELECT 1 FROM copied WHERE source_chat_id=? AND source
 const mark= db.prepare(`INSERT OR IGNORE INTO copied(source_chat_id,source_message_id,destination_chat_id,destination_message_id) VALUES(?,?,?,?)`);
 
 let client;
+let telegramStarting = false;
+let telegramError = "";
+const auth = { phone:null, code:null, password:null };
 const state=new Map();
 const locks=new Map();
+
+function waitAuth(field){
+  return new Promise((resolve,reject)=>{
+    auth[field]={resolve,reject};
+  });
+}
+function provideAuth(field,value){
+  const p=auth[field];
+  if(!p || typeof p.resolve!=="function") return false;
+  auth[field]=null;
+  p.resolve(value);
+  return true;
+}
+function failAuth(err){
+  for(const field of ["phone","code","password"]){
+    const p=auth[field];
+    if(p?.reject) p.reject(err);
+    auth[field]=null;
+  }
+}
+function authPage(message="", status="", key=""){
+  const safe=String(message).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+  const safeKey=String(key).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+  const safeStatus=String(status).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+  return `<!doctype html><html lang="uk"><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta charset="utf-8"><title>Telegram авторизація</title><style>body{font-family:Arial,sans-serif;max-width:560px;margin:40px auto;padding:20px;background:#f5f5f5;color:#222}form{background:#fff;padding:24px;border-radius:16px;box-shadow:0 2px 14px #0001}input,button{width:100%;box-sizing:border-box;padding:14px;margin:8px 0;border-radius:10px;border:1px solid #ccc;font-size:16px}button{background:#6d3df5;color:#fff;border:0;font-weight:700}small{color:#666}.msg{padding:12px;background:#eef6ff;border-radius:10px;margin-bottom:12px}</style></head><body><h2>Telegram авторизація</h2>${safeStatus?`<div class="msg">${safeStatus}</div>`:""}${safe?`<div class="msg">${safe}</div>`:""}<form method="post" action="/auth"><input type="hidden" name="key" value="${safeKey}"><label>Крок</label><select name="step" style="width:100%;padding:14px;border-radius:10px;border:1px solid #ccc"><option value="phone">1. Номер телефону</option><option value="code">2. Код Telegram</option><option value="password">3. Пароль 2FA</option></select><input name="value" autocomplete="off" placeholder="Введіть значення" required><button>Надіслати</button></form><p><small>Ця сторінка потрібна лише для першого входу. Після успішної авторизації сесія збережеться на сервері.</small></p></body></html>`;
+}
 
 async function resolve(value){
   const v=normalize(value);
@@ -113,12 +142,11 @@ async function info(entity){
 }
 
 async function add(value, table){
+  if(!client) throw new Error("Telegram ещё не авторизован. Открой /auth.");
   const x=await info(await resolve(value));
   const sql=table==="sources"
-    ? `INSERT INTO sources(chat_id,title,username) VALUES(?,?,?)
-       ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,username=excluded.username`
-    : `INSERT INTO destinations(chat_id,title,username) VALUES(?,?,?)
-       ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,username=excluded.username`;
+    ? `INSERT INTO sources(chat_id,title,username) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,username=excluded.username`
+    : `INSERT INTO destinations(chat_id,title,username) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,username=excluded.username`;
   db.prepare(sql).run(x.id,x.title,x.username);
   return x;
 }
@@ -150,7 +178,7 @@ async function enqueue(chatId,task){
 }
 
 async function processMessages(messages){
-  if(!messages?.length) return;
+  if(!messages?.length || !client) return;
   const sourceChatId=Number(messages[0].chatId?.value ?? messages[0].chatId);
   if(!sourceChatId || !db.prepare("SELECT 1 FROM sources WHERE chat_id=?").get(sourceChatId)) return;
   const ds=destFor.all(sourceChatId);
@@ -165,78 +193,26 @@ async function processMessages(messages){
         let sent=messages.length>1?await copyAlbum(messages,destination):await copyOne(messages[0],destination);
         if(!sent) return;
         const arr=Array.isArray(sent)?sent:[sent];
-        messages.forEach((m,i)=>{
-          if(arr[i]) mark.run(sourceChatId,Number(m.id),destinationChatId,Number(arr[i].id));
-        });
+        messages.forEach((m,i)=>{ if(arr[i]) mark.run(sourceChatId,Number(m.id),destinationChatId,Number(arr[i].id)); });
         console.log(`COPIED ${sourceChatId}:${messages.map(m=>m.id).join(",")} -> ${destinationChatId}`);
       }catch(e){console.error("Copy error:",e?.message||e);}
     });
   }
 }
 
-function keyboard(){return Markup.keyboard([
-  ["📥 Источники","📤 Приёмники"],
-  ["🔗 Связки","⚙️ Настройки"],
-  ["📊 Статистика","❓ Помощь"]
-]).resize().persistent();}
+function keyboard(){return Markup.keyboard([["📥 Источники","📤 Приёмники"],["🔗 Связки","⚙️ Настройки"],["📊 Статистика","❓ Помощь"]]).resize().persistent();}
 
 const bot=new Telegraf(BOT_TOKEN);
 bot.use(async(ctx,next)=>{if(ctx.from&&isAdmin(ctx.from.id)) return next();});
-
 bot.start(ctx=>ctx.reply("🤖 Telegram Post Cloner\n\nВыбери раздел.",keyboard()));
 bot.command("cancel",ctx=>{state.delete(ctx.from.id);return ctx.reply("❌ Отменено.",keyboard());});
 bot.command("id",ctx=>ctx.reply(`Ваш ID: ${ctx.from.id}`));
-
-bot.hears("📥 Источники",ctx=>{
-  let t="📥 Источники\n\n";
-  for(const r of sources()) t+=`${r.id}. ${r.title} — ${r.username||r.chat_id}\n`;
-  if(!sources().length)t+="Нет источников.\n";
-  state.set(ctx.from.id,"source"); return ctx.reply(t+"\nОтправь @username или ссылку.\n/cancel");
-});
-bot.hears("📤 Приёмники",ctx=>{
-  let t="📤 Приёмники\n\n";
-  for(const r of destinations()) t+=`${r.id}. ${r.title} — ${r.username||r.chat_id}\n`;
-  if(!destinations().length)t+="Нет приёмников.\n";
-  state.set(ctx.from.id,"destination"); return ctx.reply(t+"\nОтправь @username или ссылку.\n/cancel");
-});
-bot.hears("🔗 Связки",ctx=>{
-  let t="🔗 Связки\n\n";
-  for(const r of links()) t+=`${r.id}. ${r.source_title} → ${r.destination_title}\n`;
-  if(!links().length)t+="Нет связок.\n";
-  state.set(ctx.from.id,"link"); return ctx.reply(t+"\nСоздать: 1 2\nУдалить: /unlink ID");
-});
-bot.command("unlink",ctx=>{
-  const id=Number((ctx.message.text||"").split(/\s+/)[1]);
-  if(!Number.isInteger(id)) return ctx.reply("Формат: /unlink 3");
-  db.prepare("DELETE FROM links WHERE id=?").run(id); return ctx.reply(`✅ Связка ${id} удалена.`);
-});
-
-bot.hears("⚙️ Настройки",ctx=>ctx.reply(
-`⚙️ Настройки
-Удалять ссылки: ${getSetting("remove_links","0")==="1"?"🟢":"🔴"}
-Задержка: ${getSetting("delay","0")} сек.
-Белый фильтр: ${getSetting("keywords","нет")}
-Чёрный фильтр: ${getSetting("ban_words","нет")}
-Подпись: ${getSetting("signature","нет")}
-Замены: ${getSetting("replacements","нет")}
-
-/links_on
-/links_off
-/delay 5
-/delay_clear
-/signature Текст
-/signature_clear
-/keywords слово1, слово2
-/keywords_clear
-/ban_words слово1, слово2
-/ban_words_clear
-/replace старое -> новое
-/replace_clear`
-));
-
-for(const [cmd,key] of [["links_on","remove_links"]]){
-  bot.command(cmd,ctx=>{setSetting(key,"1");return ctx.reply("✅ Включено.");});
-}
+bot.hears("📥 Источники",ctx=>{let t="📥 Источники\n\n";for(const r of sources())t+=`${r.id}. ${r.title} — ${r.username||r.chat_id}\n`;if(!sources().length)t+="Нет источников.\n";state.set(ctx.from.id,"source");return ctx.reply(t+"\nОтправь @username или ссылку.\n/cancel");});
+bot.hears("📤 Приёмники",ctx=>{let t="📤 Приёмники\n\n";for(const r of destinations())t+=`${r.id}. ${r.title} — ${r.username||r.chat_id}\n`;if(!destinations().length)t+="Нет приёмников.\n";state.set(ctx.from.id,"destination");return ctx.reply(t+"\nОтправь @username или ссылку.\n/cancel");});
+bot.hears("🔗 Связки",ctx=>{let t="🔗 Связки\n\n";for(const r of links())t+=`${r.id}. ${r.source_title} → ${r.destination_title}\n`;if(!links().length)t+="Нет связок.\n";state.set(ctx.from.id,"link");return ctx.reply(t+"\nСоздать: 1 2\nУдалить: /unlink ID");});
+bot.command("unlink",ctx=>{const id=Number((ctx.message.text||"").split(/\s+/)[1]);if(!Number.isInteger(id))return ctx.reply("Формат: /unlink 3");db.prepare("DELETE FROM links WHERE id=?").run(id);return ctx.reply(`✅ Связка ${id} удалена.`);});
+bot.hears("⚙️ Настройки",ctx=>ctx.reply(`⚙️ Настройки\nУдалять ссылки: ${getSetting("remove_links","0")==="1"?"🟢":"🔴"}\nЗадержка: ${getSetting("delay","0")} сек.\nБелый фильтр: ${getSetting("keywords","нет")}\nЧёрный фильтр: ${getSetting("ban_words","нет")}\nПодпись: ${getSetting("signature","нет")}\nЗамены: ${getSetting("replacements","нет")}\n\n/links_on\n/links_off\n/delay 5\n/delay_clear\n/signature Текст\n/signature_clear\n/keywords слово1, слово2\n/keywords_clear\n/ban_words слово1, слово2\n/ban_words_clear\n/replace старое -> новое\n/replace_clear`));
+bot.command("links_on",ctx=>{setSetting("remove_links","1");return ctx.reply("✅ Включено.");});
 bot.command("links_off",ctx=>{setSetting("remove_links","0");return ctx.reply("✅ Отключено.");});
 bot.command("delay",ctx=>{const n=Number((ctx.message.text||"").split(/\s+/)[1]);if(!Number.isFinite(n))return ctx.reply("Формат: /delay 5");setSetting("delay",Math.max(0,Math.min(3600,Math.floor(n))));return ctx.reply("✅ Задержка сохранена.");});
 bot.command("delay_clear",ctx=>{clearSetting("delay");return ctx.reply("✅ Задержка отключена.");});
@@ -246,68 +222,54 @@ bot.command("keywords",ctx=>{setSetting("keywords",(ctx.message.text||"").split(
 bot.command("keywords_clear",ctx=>{clearSetting("keywords");return ctx.reply("✅ Фильтр очищен.");});
 bot.command("ban_words",ctx=>{setSetting("ban_words",(ctx.message.text||"").split(" ").slice(1).join(" ").trim());return ctx.reply("✅ Чёрный фильтр сохранён.");});
 bot.command("ban_words_clear",ctx=>{clearSetting("ban_words");return ctx.reply("✅ Чёрный фильтр очищен.");});
-bot.command("replace",ctx=>{
-  const v=(ctx.message.text||"").split(" ").slice(1).join(" ").trim();
-  if(!v.includes("->"))return ctx.reply("Формат: /replace старое -> новое");
-  const old=getSetting("replacements",""); setSetting("replacements",old?old+"\n"+v:v); return ctx.reply("✅ Замена добавлена.");
-});
+bot.command("replace",ctx=>{const v=(ctx.message.text||"").split(" ").slice(1).join(" ").trim();if(!v.includes("->"))return ctx.reply("Формат: /replace старое -> новое");const old=getSetting("replacements","");setSetting("replacements",old?old+"\n"+v:v);return ctx.reply("✅ Замена добавлена.");});
 bot.command("replace_clear",ctx=>{clearSetting("replacements");return ctx.reply("✅ Замены очищены.");});
-bot.hears("📊 Статистика",ctx=>{
-  const c=t=>db.prepare(`SELECT COUNT(*) c FROM ${t}`).get().c;
-  return ctx.reply(`📊 Статистика\n\n📥 Источников: ${c("sources")}\n📤 Приёмников: ${c("destinations")}\n🔗 Связок: ${c("links")}\n📨 Скопировано: ${c("copied")}`);
-});
+bot.hears("📊 Статистика",ctx=>{const c=t=>db.prepare(`SELECT COUNT(*) c FROM ${t}`).get().c;return ctx.reply(`📊 Статистика\n\n📥 Источников: ${c("sources")}\n📤 Приёмников: ${c("destinations")}\n🔗 Связок: ${c("links")}\n📨 Скопировано: ${c("copied")}`);});
 bot.hears("❓ Помощь",ctx=>ctx.reply("❓ Добавь источник, приёмник и связку. После этого новые посты копируются автоматически."));
-
-bot.on("text",async ctx=>{
-  const s=state.get(ctx.from.id), v=(ctx.message.text||"").trim();
-  if(!s||!v||v.startsWith("/")) return;
-  try{
-    if(s==="source"){const x=await add(v,"sources");state.delete(ctx.from.id);return ctx.reply(`✅ Источник добавлен.\n${x.title}\nID: ${x.id}`,keyboard());}
-    if(s==="destination"){const x=await add(v,"destinations");state.delete(ctx.from.id);return ctx.reply(`✅ Приёмник добавлен.\n${x.title}\nID: ${x.id}`,keyboard());}
-    if(s==="link"){
-      const p=v.split(/\s+/); if(p.length!==2||!p.every(x=>/^\d+$/.test(x))) return ctx.reply("Формат: 1 2");
-      if(!db.prepare("SELECT 1 FROM sources WHERE id=?").get(Number(p[0]))) return ctx.reply("❌ Источник не найден.");
-      if(!db.prepare("SELECT 1 FROM destinations WHERE id=?").get(Number(p[1]))) return ctx.reply("❌ Приёмник не найден.");
-      db.prepare("INSERT OR IGNORE INTO links(source_id,destination_id) VALUES(?,?)").run(Number(p[0]),Number(p[1]));
-      state.delete(ctx.from.id); return ctx.reply("✅ Связка создана.",keyboard());
-    }
-  }catch(e){return ctx.reply(`❌ ${e.message||e}`);}
-});
+bot.on("text",async ctx=>{const s=state.get(ctx.from.id),v=(ctx.message.text||"").trim();if(!s||!v||v.startsWith("/"))return;try{if(s==="source"){const x=await add(v,"sources");state.delete(ctx.from.id);return ctx.reply(`✅ Источник добавлен.\n${x.title}\nID: ${x.id}`,keyboard());}if(s==="destination"){const x=await add(v,"destinations");state.delete(ctx.from.id);return ctx.reply(`✅ Приёмник добавлен.\n${x.title}\nID: ${x.id}`,keyboard());}if(s==="link"){const p=v.split(/\s+/);if(p.length!==2||!p.every(x=>/^\d+$/.test(x)))return ctx.reply("Формат: 1 2");if(!db.prepare("SELECT 1 FROM sources WHERE id=?").get(Number(p[0])))return ctx.reply("❌ Источник не найден.");if(!db.prepare("SELECT 1 FROM destinations WHERE id=?").get(Number(p[1])))return ctx.reply("❌ Приёмник не найден.");db.prepare("INSERT OR IGNORE INTO links(source_id,destination_id) VALUES(?,?)").run(Number(p[0]),Number(p[1]));state.delete(ctx.from.id);return ctx.reply("✅ Связка создана.",keyboard());}}catch(e){return ctx.reply(`❌ ${e.message||e}`);}});
 bot.catch(e=>console.error("Bot error:",e));
 
 const app=express();
+app.use(express.urlencoded({extended:false}));
 app.get("/",(req,res)=>res.status(200).send("Telegram Post Cloner is running."));
-app.get("/health",(req,res)=>res.json({ok:true,telegram:!!client,uptime:process.uptime()}));
+app.get("/health",(req,res)=>res.json({ok:true,telegram:!!client,telegramStarting,telegramError:telegramError||null,uptime:process.uptime()}));
+app.get("/auth",(req,res)=>{if(!AUTH_KEY||req.query.key!==AUTH_KEY)return res.status(403).send("Forbidden");if(client&&!telegramStarting)return res.send(authPage("Telegram уже авторизован.","",AUTH_KEY));res.send(authPage("Введи номер телефона, затем код из Telegram. Если включён 2FA — после кода введи пароль.","Авторизация",AUTH_KEY));});
+app.post("/auth",async(req,res)=>{if(!AUTH_KEY||req.body.key!==AUTH_KEY)return res.status(403).send("Forbidden");if(!telegramStarting)return res.send(authPage("Сейчас нет активного запроса авторизации. Перезапусти сервис и открой эту страницу снова.","",AUTH_KEY));const step=String(req.body.step||"");const value=String(req.body.value||"").trim();if(!value)return res.send(authPage("Пустое значение.","",AUTH_KEY));if(!["phone","code","password"].includes(step))return res.send(authPage("Неверный шаг.","",AUTH_KEY));if(!provideAuth(step,value))return res.send(authPage(`Сейчас Telegram не ожидает значение «${step}». Выполни шаги по порядку.`,"",AUTH_KEY));res.send(authPage(`Значение шага «${step}» передано Telegram. Подожди и продолжай следующим шагом.`,"OK",AUTH_KEY));});
 app.listen(PORT,()=>console.log(`HTTP server on ${PORT}`));
 
-(async()=>{
+async function startTelegram(){
+  if(telegramStarting) return;
+  telegramStarting=true;
+  telegramError="";
   try{
     const saved=getSetting("mtproto_session","");
     client=new TelegramClient(new StringSession(saved),API_ID,API_HASH,{connectionRetries:10,autoReconnect:true});
     await client.start({
-      phoneNumber:async()=>input.text("Telegram phone number: "),
-      password:async()=>input.text("Telegram 2FA password: "),
-      phoneCode:async()=>input.text("Telegram code: "),
+      phoneNumber:async()=>waitAuth("phone"),
+      password:async()=>waitAuth("password"),
+      phoneCode:async()=>waitAuth("code"),
       onError:e=>console.error("Telegram auth:",e)
     });
     setSetting("mtproto_session",client.session.save());
     const me=await client.getMe();
     console.log(`Telegram account: ${me.id} @${me.username||""}`);
+    client.addEventHandler(async e=>{try{const m=e.message;if(m&&!m.groupedId)await processMessages([m]);}catch(err){console.error("NewMessage:",err);}},new events.NewMessage({}));
+    client.addEventHandler(async e=>{try{await processMessages((e.messages||[]).sort((a,b)=>Number(a.id)-Number(b.id)));}catch(err){console.error("Album:",err);}},new events.Album({}));
+    console.log("Telegram client connected.");
+  }catch(e){
+    telegramError=e?.message||String(e);
+    console.error("Telegram connection error:",e);
+    client=null;
+    failAuth(e);
+  }finally{
+    telegramStarting=false;
+  }
+}
 
-    client.addEventHandler(async e=>{
-      try{
-        const m=e.message;
-        if(m&&!m.groupedId) await processMessages([m]);
-      }catch(err){console.error("NewMessage:",err);}
-    },new events.NewMessage({}));
-
-    client.addEventHandler(async e=>{
-      try{await processMessages((e.messages||[]).sort((a,b)=>Number(a.id)-Number(b.id)));}catch(err){console.error("Album:",err);}
-    },new events.Album({}));
-
-    await bot.launch();
-    console.log("Management bot started.");
-    process.once("SIGINT",()=>bot.stop("SIGINT"));
-    process.once("SIGTERM",()=>bot.stop("SIGTERM"));
-  }catch(e){console.error("FATAL:",e);process.exit(1);}
+(async()=>{
+  await bot.launch();
+  console.log("Management bot started.");
+  startTelegram().catch(e=>console.error("startTelegram:",e));
+  process.once("SIGINT",()=>bot.stop("SIGINT"));
+  process.once("SIGTERM",()=>bot.stop("SIGTERM"));
 })();
