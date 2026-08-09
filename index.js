@@ -196,14 +196,14 @@ app.use(express.urlencoded({extended:false}));
 app.get("/",(req,res)=>res.status(200).send("Telegram Post Cloner is running."));
 app.get("/health",(req,res)=>res.json({ok:true,telegram:!!client&&!loginInProgress,loginInProgress,telegramStarting,telegramError:telegramError||null,sessionSource:MT_SESSION?"env":"db",uptime:process.uptime()}));
 app.get("/auth",async(req,res)=>{
-  if(!AUTH_KEY||req.query.key!==AUTH_KEY)return res.status(403).send("Forbidden");
+  if(AUTH_KEY && req.query.key!==AUTH_KEY)return res.status(403).send("Forbidden");
   if(client&&!loginInProgress)return res.send(authPage("Telegram уже авторизован.","OK",AUTH_KEY));
   await beginLogin();
   const step=auth.phone?"code":auth.password?"password":"phone";
   res.send(authPage("Введи номер телефона, затем код из Telegram. Если включён 2FA — после кода введи пароль.",telegramError?"ERROR":"Авторизация готова",AUTH_KEY,step));
 });
 app.post("/auth",async(req,res)=>{
-  if(!AUTH_KEY||req.body.key!==AUTH_KEY)return res.status(403).send("Forbidden");
+  if(AUTH_KEY && req.body.key!==AUTH_KEY)return res.status(403).send("Forbidden");
   if(client&&!loginInProgress)return res.send(authPage("Telegram уже авторизован.","OK",AUTH_KEY));
   await beginLogin();
   const step=String(req.body.step||"");
