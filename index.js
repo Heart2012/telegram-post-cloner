@@ -13,6 +13,7 @@ const ADMIN_IDS = new Set((process.env.ADMIN_IDS || "").split(",").map(x => x.tr
 const PORT = Number(process.env.PORT || 3000);
 const DB_PATH = process.env.DB_PATH || "cloner.db";
 const AUTH_KEY = process.env.AUTH_KEY || "";
+const MT_SESSION = process.env.MT_SESSION || "";
 
 if (!API_ID || !API_HASH || !BOT_TOKEN || !ADMIN_IDS.size) {
   throw new Error("Заполни API_ID, API_HASH, BOT_TOKEN и ADMIN_IDS.");
@@ -118,14 +119,16 @@ function setupHandlers(){
 
 async function connectSavedSession(){
   if(telegramStarting||client)return;
-  const saved=getSetting("mtproto_session","");
+  const saved=MT_SESSION || getSetting("mtproto_session","");
   if(!saved)return;
   telegramStarting=true;telegramError="";
   try{
     const c=new TelegramClient(new StringSession(saved),API_ID,API_HASH,{connectionRetries:10,autoReconnect:true});
     await c.connect();
     if(!(await c.checkAuthorization())){await c.disconnect();return;}
-    client=c;setupHandlers();
+    client=c;
+    if(!MT_SESSION)setSetting("mtproto_session",saved);
+    setupHandlers();
     const me=await client.getMe();
     console.log(`Telegram account restored: ${me.id} @${me.username||""}`);
   }catch(e){telegramError=e?.message||String(e);console.error("Session restore error:",e);}finally{telegramStarting=false;}
@@ -143,7 +146,8 @@ async function beginLogin(){
     phoneCode:async()=>waitAuth("code"),
     onError:e=>console.error("Telegram auth:",e)
   }).then(async()=>{
-    setSetting("mtproto_session",c.session.save());
+    const session=c.session.save();
+    setSetting("mtproto_session",session);
     setupHandlers();
     const me=await c.getMe();
     console.log(`Telegram account authorized: ${me.id} @${me.username||""}`);
@@ -163,6 +167,8 @@ bot.use(async(ctx,next)=>{if(ctx.from&&isAdmin(ctx.from.id))return next();});
 bot.start(ctx=>ctx.reply("🤖 Telegram Post Cloner\n\nВыбери раздел.",keyboard()));
 bot.command("cancel",ctx=>{state.delete(ctx.from.id);return ctx.reply("❌ Отменено.",keyboard());});
 bot.command("id",ctx=>ctx.reply(`Ваш ID: ${ctx.from.id}`));
+bot.command("status",async ctx=>{if(!client)return ctx.reply("❌ Telegram не авторизован.");try{const me=await client.getMe();return ctx.reply(`✅ Telegram авторизован.\nID: ${me.id}\nUsername: @${me.username||"—"}`);}catch(e){return ctx.reply(`❌ Ошибка: ${e.message||e}`);}});
+bot.command("session",ctx=>{if(!client)return ctx.reply("❌ Telegram не авторизован.");const session=client.session?.save?.()||"";if(!session)return ctx.reply("❌ Session недоступна.");return ctx.reply(`🔐 MT_SESSION\n\n${session}\n\n⚠️ Секретная строка. Не отправляй её другим людям и после копирования удали это сообщение.`,{protect_content:true});});
 bot.hears("📥 Источники",ctx=>{let t="📥 Источники\n\n";for(const r of sources())t+=`${r.id}. ${r.title} — ${r.username||r.chat_id}\n`;if(!sources().length)t+="Нет источников.\n";state.set(ctx.from.id,"source");return ctx.reply(t+"\nОтправь @username или ссылку.\n/cancel");});
 bot.hears("📤 Приёмники",ctx=>{let t="📤 Приёмники\n\n";for(const r of destinations())t+=`${r.id}. ${r.title} — ${r.username||r.chat_id}\n`;if(!destinations().length)t+="Нет приёмников.\n";state.set(ctx.from.id,"destination");return ctx.reply(t+"\nОтправь @username или ссылку.\n/cancel");});
 bot.hears("🔗 Связки",ctx=>{let t="🔗 Связки\n\n";for(const r of links())t+=`${r.id}. ${r.source_title} → ${r.destination_title}\n`;if(!links().length)t+="Нет связок.\n";state.set(ctx.from.id,"link");return ctx.reply(t+"\nСоздать: 1 2\nУдалить: /unlink ID");});
@@ -181,14 +187,14 @@ bot.command("ban_words_clear",ctx=>{clearSetting("ban_words");return ctx.reply("
 bot.command("replace",ctx=>{const v=(ctx.message.text||"").split(" ").slice(1).join(" ").trim();if(!v.includes("->"))return ctx.reply("Формат: /replace старое -> новое");const old=getSetting("replacements","");setSetting("replacements",old?old+"\n"+v:v);return ctx.reply("✅ Замена добавлена.");});
 bot.command("replace_clear",ctx=>{clearSetting("replacements");return ctx.reply("✅ Замены очищены.");});
 bot.hears("📊 Статистика",ctx=>{const c=t=>db.prepare(`SELECT COUNT(*) c FROM ${t}`).get().c;return ctx.reply(`📊 Статистика\n\n📥 Источников: ${c("sources")}\n📤 Приёмников: ${c("destinations")}\n🔗 Связок: ${c("links")}\n📨 Скопировано: ${c("copied")}`);});
-bot.hears("❓ Помощь",ctx=>ctx.reply("❓ Добавь источник, приёмник и связку. После этого новые посты копируются автоматически."));
+bot.hears("❓ Помощь",ctx=>ctx.reply("❓ Добавь источник, приёмник и связку. После этого новые посты копируются автоматически.\n\n/status — статус Telegram\n/session — получить MT_SESSION для Hostinger"));
 bot.on("text",async ctx=>{const s=state.get(ctx.from.id),v=(ctx.message.text||"").trim();if(!s||!v||v.startsWith("/"))return;try{if(s==="source"){const x=await add(v,"sources");state.delete(ctx.from.id);return ctx.reply(`✅ Источник добавлен.\n${x.title}\nID: ${x.id}`,keyboard());}if(s==="destination"){const x=await add(v,"destinations");state.delete(ctx.from.id);return ctx.reply(`✅ Приёмник добавлен.\n${x.title}\nID: ${x.id}`,keyboard());}if(s==="link"){const p=v.split(/\s+/);if(p.length!==2||!p.every(x=>/^\d+$/.test(x)))return ctx.reply("Формат: 1 2");if(!db.prepare("SELECT 1 FROM sources WHERE id=?").get(Number(p[0])))return ctx.reply("❌ Источник не найден.");if(!db.prepare("SELECT 1 FROM destinations WHERE id=?").get(Number(p[1])))return ctx.reply("❌ Приёмник не найден.");db.prepare("INSERT OR IGNORE INTO links(source_id,destination_id) VALUES(?,?)").run(Number(p[0]),Number(p[1]));state.delete(ctx.from.id);return ctx.reply("✅ Связка создана.",keyboard());}}catch(e){return ctx.reply(`❌ ${e.message||e}`);}});
 bot.catch(e=>console.error("Bot error:",e));
 
 const app=express();
 app.use(express.urlencoded({extended:false}));
 app.get("/",(req,res)=>res.status(200).send("Telegram Post Cloner is running."));
-app.get("/health",(req,res)=>res.json({ok:true,telegram:!!client&&!loginInProgress,loginInProgress,telegramStarting,telegramError:telegramError||null,uptime:process.uptime()}));
+app.get("/health",(req,res)=>res.json({ok:true,telegram:!!client&&!loginInProgress,loginInProgress,telegramStarting,telegramError:telegramError||null,sessionSource:MT_SESSION?"env":"db",uptime:process.uptime()}));
 app.get("/auth",async(req,res)=>{
   if(!AUTH_KEY||req.query.key!==AUTH_KEY)return res.status(403).send("Forbidden");
   if(client&&!loginInProgress)return res.send(authPage("Telegram уже авторизован.","OK",AUTH_KEY));
