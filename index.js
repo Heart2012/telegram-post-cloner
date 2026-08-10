@@ -4,4 +4,5 @@ require("./startup-fix.js");
 require("./language.js");
 require("./links-ui-fix.js");
 require("./link-settings-live2.js");
+require("./peer-id-fix.js");
 require("./core.js");
