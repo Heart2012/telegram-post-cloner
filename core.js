@@ -7,5 +7,4 @@ const { TelegramClient } = require("telegram");
 const { NewMessage } = require("telegram/events");
 const { StringSession } = require("telegram/sessions");
 
-// TEMPORARY STARTUP PATCH PLACEHOLDER
-// DO NOT DEPLOY THIS FILE
+// RESTORE PLACEHOLDER — fetch parent version before replacing
