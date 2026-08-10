@@ -1,7 +1,6 @@
 // Direct entrypoint.
-// Load the stable language/link runtime and then the cloner core.
+// Keep startup minimal: the core already contains the bot handlers.
+// The extra link runtime monkey-patched Telegraf and could prevent handlers from working.
 require("./startup-fix.js");
 require("./language.js");
-require("./link-settings.js");
-require("./link-runtime.js");
 require("./core.js");
