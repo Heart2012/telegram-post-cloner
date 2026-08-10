@@ -96,6 +96,18 @@ try {
     return result;
   }
 
+  function mainKeyboard(lang) {
+    const rows = lang === "ru"
+      ? [["📥 Источники", "📤 Приёмники"], ["🔗 Связки", "⚙️ Настройки"], ["📊 Статистика", "❓ Помощь"]]
+      : [["📥 Джерела", "📤 Приймачі"], ["🔗 Зв’язки", "⚙️ Налаштування"], ["📊 Статистика", "❓ Допомога"]];
+    rows.push(["🌐 Мова / Язык"]);
+    return Markup.keyboard(rows).resize().persistent();
+  }
+
+  function languageKeyboard() {
+    return Markup.keyboard([["🇺🇦 Українська", "🇷🇺 Русский"], ["↩️ Назад"]]).resize().persistent();
+  }
+
   function translateExtra(extra, lang) {
     if (!extra || typeof extra !== "object" || !extra.reply_markup) return extra;
     const copy = { ...extra };
@@ -105,9 +117,8 @@ try {
         typeof button === "string" ? translate(button, lang) : button
       ));
       const languageButton = "🌐 Мова / Язык";
-      if (!keyboard.some(row => row.some(button => button === languageButton || button === "🌐 Мова" || button === "🌐 Язык"))) {
-        keyboard.push([languageButton]);
-      }
+      keyboard = keyboard.filter(row => !row.some(button => button === "🇺🇦 Українська" || button === "🇷🇺 Русский" || button === "↩️ Назад"));
+      if (!keyboard.some(row => row.some(button => button === languageButton))) keyboard.push([languageButton]);
       copy.reply_markup = { ...markup, keyboard };
     }
     return copy;
@@ -147,10 +158,6 @@ try {
   const ruButton = "🇷🇺 Русский";
   const backButton = "↩️ Назад";
 
-  function languageKeyboard() {
-    return Markup.keyboard([[ukButton, ruButton], [backButton]]).resize().persistent();
-  }
-
   if (Composer?.prototype?.use) {
     const originalUse = Composer.prototype.use;
     Composer.prototype.use = function (...middlewares) {
@@ -165,14 +172,15 @@ try {
           }
           if (text === ukButton) {
             setLang(ctx.from.id, "uk");
-            return ctx.reply("✅ Мову змінено на українську.");
+            return ctx.reply("✅ Мову змінено на українську.", mainKeyboard("uk"));
           }
           if (text === ruButton) {
             setLang(ctx.from.id, "ru");
-            return ctx.reply("✅ Язык изменён на русский.");
+            return ctx.reply("✅ Язык изменён на русский.", mainKeyboard("ru"));
           }
           if (text === backButton) {
-            return ctx.reply(getLang(ctx.from.id) === "uk" ? "↩️ Головне меню." : "↩️ Главное меню.");
+            const lang = getLang(ctx.from.id);
+            return ctx.reply(lang === "uk" ? "↩️ Головне меню." : "↩️ Главное меню.", mainKeyboard(lang));
           }
           normalizeIncomingText(ctx);
           return next();
