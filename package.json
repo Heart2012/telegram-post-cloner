@@ -1,10 +1,10 @@
 {
   "name": "telegram-post-cloner",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "private": true,
   "main": "index.js",
   "scripts": {
-    "start": "node -r ./language.js -r ./link-settings.js index.js"
+    "start": "node -r ./startup-fix.js -r ./language.js -r ./link-settings.js index.js"
   },
   "engines": {
     "node": ">=18"
