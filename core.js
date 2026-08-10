@@ -20,6 +20,7 @@ const ADMIN_IDS = new Set((process.env.ADMIN_IDS || "").split(",").map(x => x.tr
 const PORT = Number(process.env.PORT || 3000);
 const DB_PATH = process.env.DB_PATH;
 const AUTH_KEY = process.env.AUTH_KEY || "";
+const AUTH_URL = (process.env.AUTH_URL || "").replace(/\/$/, "");
 const MT_SESSION = process.env.MT_SESSION || "";
 const SESSION_PATH = process.env.MT_SESSION_FILE || path.join(PERSISTENT_DIR, "telegram.session");
 
@@ -110,6 +111,13 @@ function linkListText(){let t="🔗 Связки\n\n";const ls=links();if(!ls.le
 const bot=new Telegraf(BOT_TOKEN);
 bot.use(async(ctx,next)=>{if(ctx.from&&isAdmin(ctx.from.id))return next();});
 bot.start(ctx=>ctx.reply("🤖 Telegram Post Cloner\n\nВыбери раздел.",keyboard()));
+bot.command("auth",async ctx=>{
+  if(client&&!loginInProgress)return ctx.reply("✅ Telegram уже авторизован.");
+  if(!AUTH_URL)return ctx.reply("🔐 Авторизация Telegram\n\nСначала укажи в настройках Hostinger/Render переменную AUTH_URL — полный адрес сервиса, например https://your-service.onrender.com");
+  await beginLogin();
+  const url=`${AUTH_URL}/auth${AUTH_KEY?`?key=${encodeURIComponent(AUTH_KEY)}`:""}`;
+  return ctx.reply("🔐 Авторизация Telegram\n\nНажми кнопку ниже. Откроется защищённая страница авторизации.\n\n1️⃣ Номер телефона\n2️⃣ Код из Telegram\n3️⃣ Пароль 2FA (если включён)",Markup.inlineKeyboard([[Markup.button.url("🔐 Авторизовать Telegram",url)]]));
+});
 bot.command("cancel",ctx=>{state.delete(ctx.from.id);return ctx.reply("❌ Отменено.",keyboard());});
 bot.command("id",ctx=>ctx.reply(`Ваш ID: ${ctx.from.id}`));
 bot.command("status",async ctx=>{if(!client)return ctx.reply("❌ Telegram не авторизован.");try{const me=await client.getMe();saveSession(client.session.save());return ctx.reply(`✅ Telegram авторизован.\nID: ${me.id}\nUsername: @${me.username||"—"}`);}catch(e){return ctx.reply(`❌ Ошибка: ${e.message||e}`);}});
@@ -140,7 +148,7 @@ bot.command("ban_words_clear",ctx=>{clearSetting("ban_words");return ctx.reply("
 bot.command("replace",ctx=>{const v=(ctx.message.text||"").split(" ").slice(1).join(" ").trim();if(!v.includes("->"))return ctx.reply("Формат: /replace старое -> новое");const old=getSetting("replacements","");setSetting("replacements",old?old+"\n"+v:v);return ctx.reply("✅ Замена добавлена.");});
 bot.command("replace_clear",ctx=>{clearSetting("replacements");return ctx.reply("✅ Замены очищены.");});
 bot.hears("📊 Статистика",ctx=>{const c=t=>db.prepare(`SELECT COUNT(*) c FROM ${t}`).get().c;return ctx.reply(`📊 Статистика\n\n📥 Источников: ${c("sources")}\n📤 Приёмников: ${c("destinations")}\n🔗 Связок: ${c("links")}\n📨 Скопировано: ${c("copied")}`);});
-bot.hears("❓ Помощь",ctx=>ctx.reply("❓ Добавь источник, приёмник и связку. После этого новые посты копируются автоматически.\n\n/status — статус Telegram\n/session — получить MT_SESSION для Hostinger"));
+bot.hears("❓ Помощь",ctx=>ctx.reply("❓ Добавь источник, приёмник и связку. После этого новые посты копируются автоматически.\n\n/auth — авторизация Telegram\n/status — статус Telegram\n/session — получить MT_SESSION для Hostinger"));
 
 bot.on("message",async(ctx,next)=>{const s=state.get(ctx.from.id);if(s!=="source"&&s!=="destination")return next();const chat=forwardedChatFromMessage(ctx.message);if(!chat)return next();try{const x=await addForwardedChat(ctx.message,s==="source"?"sources":"destinations");state.delete(ctx.from.id);const label=s==="source"?"Источник":"Приёмник";return ctx.reply(`✅ ${label} добавлен.\n\n📌 ${x.title}\n🆔 ${x.id}${x.username?`\n👤 @${x.username}`:""}`,keyboard());}catch(e){return ctx.reply(`❌ ${e.message||e}`);}});
 bot.on("text",async ctx=>{const s=state.get(ctx.from.id),v=(ctx.message.text||"").trim();if(!s||!v||v.startsWith("/"))return;try{if(s==="source"){const x=await add(v,"sources");state.delete(ctx.from.id);return ctx.reply(`✅ Источник добавлен.\n${x.title}\nID: ${x.id}`,keyboard());}if(s==="destination"){const x=await add(v,"destinations");state.delete(ctx.from.id);return ctx.reply(`✅ Приёмник добавлен.\n${x.title}\nID: ${x.id}`,keyboard());}}catch(e){return ctx.reply(`❌ ${e.message||e}`);}});
