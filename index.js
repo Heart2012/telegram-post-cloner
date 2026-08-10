@@ -1,9 +1,7 @@
-// Direct entrypoint.
-// Startup helpers are loaded before core so the stable core remains unchanged.
+// Stable startup chain.
 require("./startup-fix.js");
 require("./language.js");
 require("./links-ui-fix.js");
 require("./link-settings-live2.js");
-require("./peer-id-fix.js");
-require("./event-fix.js");
+require("./forwarder-hook.js");
 require("./core.js");
