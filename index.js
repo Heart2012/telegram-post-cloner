@@ -1,17 +1,28 @@
 require("dotenv").config();
 
+const path = require("path");
+const fs = require("fs");
 const express = require("express");
 const Database = require("better-sqlite3");
 const { Telegraf, Markup } = require("telegraf");
-const { TelegramClient, events } = require("telegram");
+const { TelegramClient } = require("telegram");
+const events = require("telegram/events");
 const { StringSession } = require("telegram/sessions");
+
+// Hostinger creates a new deployment/version directory on every redeploy.
+// Keep SQLite (and the saved MTProto session) in the persistent HOME directory.
+if (!process.env.DB_PATH) {
+  const persistentDir = path.join(process.env.HOME || process.cwd(), ".telegram-post-cloner");
+  try { fs.mkdirSync(persistentDir, { recursive: true }); } catch (_) {}
+  process.env.DB_PATH = path.join(persistentDir, "cloner.db");
+}
 
 const API_ID = Number(process.env.API_ID || 0);
 const API_HASH = process.env.API_HASH || "";
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
 const ADMIN_IDS = new Set((process.env.ADMIN_IDS || "").split(",").map(x => x.trim()).filter(Boolean).map(Number));
 const PORT = Number(process.env.PORT || 3000);
-const DB_PATH = process.env.DB_PATH || "cloner.db";
+const DB_PATH = process.env.DB_PATH;
 const AUTH_KEY = process.env.AUTH_KEY || "";
 const MT_SESSION = process.env.MT_SESSION || "";
 
@@ -119,19 +130,32 @@ function setupHandlers(){
 
 async function connectSavedSession(){
   if(telegramStarting||client)return;
-  const saved=MT_SESSION || getSetting("mtproto_session","");
+  // Always prefer the DB session. This prevents an old MT_SESSION env value
+  // from overriding the freshly authorized session.
+  const saved=getSetting("mtproto_session","") || MT_SESSION;
   if(!saved)return;
   telegramStarting=true;telegramError="";
+  let c=null;
   try{
-    const c=new TelegramClient(new StringSession(saved),API_ID,API_HASH,{connectionRetries:10,autoReconnect:true});
+    c=new TelegramClient(new StringSession(saved),API_ID,API_HASH,{connectionRetries:10,autoReconnect:true});
     await c.connect();
-    if(!(await c.checkAuthorization())){await c.disconnect();return;}
+    if(!(await c.checkAuthorization())){
+      await c.disconnect();
+      clearSetting("mtproto_session");
+      return;
+    }
+    const me=await c.getMe();
     client=c;
-    if(!MT_SESSION)setSetting("mtproto_session",saved);
-    setupHandlers();
-    const me=await client.getMe();
+    setSetting("mtproto_session",c.session.save());
+    try{setupHandlers();}catch(e){console.error("Handler setup error after restore:",e);}
     console.log(`Telegram account restored: ${me.id} @${me.username||""}`);
-  }catch(e){telegramError=e?.message||String(e);console.error("Session restore error:",e);}finally{telegramStarting=false;}
+  }catch(e){
+    telegramError=e?.message||String(e);
+    console.error("Session restore error:",e);
+    if(c){try{await c.disconnect();}catch(_) {}}
+    // A revoked/invalid auth key must not be retried forever.
+    if(/AUTH_KEY_UNREGISTERED|SESSION_REVOKED|SESSION_EXPIRED/i.test(String(e?.message||e))) clearSetting("mtproto_session");
+  }finally{telegramStarting=false;}
 }
 
 async function beginLogin(){
@@ -146,10 +170,11 @@ async function beginLogin(){
     phoneCode:async()=>waitAuth("code"),
     onError:e=>console.error("Telegram auth:",e)
   }).then(async()=>{
+    // Save the session immediately after Telegram confirms the login.
     const session=c.session.save();
     setSetting("mtproto_session",session);
-    setupHandlers();
     const me=await c.getMe();
+    try{setupHandlers();}catch(e){console.error("Handler setup error after login:",e);}
     console.log(`Telegram account authorized: ${me.id} @${me.username||""}`);
     telegramError="";
   }).catch(e=>{
@@ -194,7 +219,7 @@ bot.catch(e=>console.error("Bot error:",e));
 const app=express();
 app.use(express.urlencoded({extended:false}));
 app.get("/",(req,res)=>res.status(200).send("Telegram Post Cloner is running."));
-app.get("/health",(req,res)=>res.json({ok:true,telegram:!!client&&!loginInProgress,loginInProgress,telegramStarting,telegramError:telegramError||null,sessionSource:MT_SESSION?"env":"db",uptime:process.uptime()}));
+app.get("/health",(req,res)=>res.json({ok:true,telegram:!!client&&!loginInProgress,loginInProgress,telegramStarting,telegramError:telegramError||null,sessionSource:getSetting("mtproto_session","")?"db":MT_SESSION?"env":"none",dbPath:DB_PATH,uptime:process.uptime()}));
 app.get("/auth",async(req,res)=>{
   if(AUTH_KEY && req.query.key!==AUTH_KEY)return res.status(403).send("Forbidden");
   if(client&&!loginInProgress)return res.send(authPage("Telegram уже авторизован.","OK",AUTH_KEY));
