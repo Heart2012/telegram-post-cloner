@@ -1,5 +1,6 @@
 // Stable startup chain.
 require("./startup-fix.js");
+require("./startup-order-fix.js");
 require("./language.js");
 require("./links-ui-fix.js");
 require("./link-settings-live2.js");
