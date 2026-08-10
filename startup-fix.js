@@ -41,6 +41,7 @@ try {
     ["Создать: 1 2", "Створити: 1 2"],
     ["Удалить: /unlink ID", "Видалити: /unlink ID"],
     ["Формат: /unlink 3", "Формат: /unlink 3"],
+    ["Связка создана.", "Зв’язок створено."],
     ["Связка ", "Зв’язок "],
     [" удалена.", " видалено."],
     ["⚙️ Настройки\nУдалять ссылки:", "⚙️ Налаштування\nВидалення посилань:"],
@@ -50,8 +51,6 @@ try {
     ["Подпись:", "Підпис:"],
     ["Замены:", "Заміни:"],
     ["нет", "немає"],
-    ["🟢", "🟢"],
-    ["🔴", "🔴"],
     ["Включено.", "Увімкнено."],
     ["Отключено.", "Вимкнено."],
     ["Задержка сохранена.", "Затримку збережено."],
@@ -67,7 +66,6 @@ try {
     ["Формат: 1 2", "Формат: 1 2"],
     ["Источник не найден.", "Джерело не знайдено."],
     ["Приёмник не найден.", "Приймач не знайдено."],
-    ["Связка создана.", "Зв’язок створено."],
     ["📊 Статистика\n\n📥 Источников:", "📊 Статистика\n\n📥 Джерел:"],
     ["📤 Приёмников:", "📤 Приймачів:"],
     ["🔗 Связок:", "🔗 Зв’язків:"],
@@ -77,10 +75,6 @@ try {
     ["/session — получить MT_SESSION для Hostinger", "/session — отримати MT_SESSION для Hostinger"],
     ["Источник добавлен.", "Джерело додано."],
     ["Приёмник добавлен.", "Приймач додано."],
-    ["Ваш ID:", "Ваш ID:"],
-    ["Telegram account authorized", "Telegram account authorized"],
-    ["Формат: /delay 5", "Формат: /delay 5"],
-    ["Формат: /signature Текст", "Формат: /signature Текст"],
     ["Формат: /replace старое -> новое", "Формат: /replace старе -> нове"]
   ];
 
@@ -91,13 +85,6 @@ try {
       result = result.split(from).join(to);
     }
     return result;
-  }
-
-  if (Context?.prototype?.reply) {
-    const originalReply = Context.prototype.reply;
-    Context.prototype.reply = function (text, extra) {
-      return originalReply.call(this, translate(text), translateExtra(extra));
-    };
   }
 
   function translateExtra(extra) {
@@ -123,6 +110,17 @@ try {
     return copy;
   }
 
+  if (Context?.prototype?.reply) {
+    const originalReply = Context.prototype.reply;
+    Context.prototype.reply = function (text, extra) {
+      return originalReply.call(
+        this,
+        translate(text),
+        translateExtra(extra)
+      );
+    };
+  }
+
   if (Markup?.keyboard) {
     const originalKeyboard = Markup.keyboard;
     Markup.keyboard = function (keyboard, ...args) {
@@ -138,11 +136,18 @@ try {
           )
         : keyboard;
 
-      return originalKeyboard.call(this, translated, ...args);
+      return originalKeyboard.call(
+        this,
+        translated,
+        ...args
+      );
     };
   }
 
   console.log("Ukrainian Telegram UI translation layer loaded.");
 } catch (e) {
-  console.error("Ukrainian UI translation layer error:", e?.message || e);
+  console.error(
+    "Ukrainian UI translation layer error:",
+    e?.message || e
+  );
 }
