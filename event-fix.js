@@ -1,6 +1,5 @@
 // Reliable MTProto forwarding layer.
-// This is intentionally independent from the core handler so message events are
-// still processed when GramJS exposes channel peer IDs through peerId.channelId.
+// Handles GramJS channel peer IDs and forwards new messages to linked destinations.
 
 try {
   const fs = require("fs");
@@ -9,8 +8,6 @@ try {
   const { TelegramClient } = require("telegram");
   const events = require("telegram/events");
 
-  // IMPORTANT: do not name any local function `process`, because Node's global
-  // process object is needed here for environment variables.
   const nodeProcess = globalThis.process;
   const persistentDir = path.join(nodeProcess?.env?.HOME || nodeProcess?.cwd?.() || ".", ".telegram-post-cloner");
   const dbPath = nodeProcess?.env?.DB_PATH || path.join(persistentDir, "cloner.db");
@@ -48,12 +45,22 @@ try {
     return Number(value) || 0;
   }
 
+  // GramJS exposes Api.PeerChannel.channelId as the positive channel ID,
+  // while the database/UI stores Telegram peer IDs as -100xxxxxxxxxx.
+  // Example: channelId 2151348418 -> -1002151348418.
+  function channelPeerId(value) {
+    const id = idOf(value);
+    if (!id) return 0;
+    return -1000000000000 - id;
+  }
+
   function messageChatId(message) {
     const peer = message?.peerId || message?.peerID;
-    if (peer?.channelId !== undefined) return idOf(peer.channelId);
+    if (peer?.channelId !== undefined) return channelPeerId(peer.channelId);
     if (peer?.chatId !== undefined) return idOf(peer.chatId);
     if (peer?.userId !== undefined) return idOf(peer.userId);
     if (message?.chatId !== undefined) return idOf(message.chatId);
+    if (message?.chatID !== undefined) return idOf(message.chatID);
     return 0;
   }
 
@@ -108,6 +115,9 @@ try {
       console.log(`EVENT-FIX skip: cannot determine peer/message ID (peer=${JSON.stringify(first.peerId || null)}, chat=${String(first.chatId || "")}, msg=${String(first.id || "")})`);
       return;
     }
+
+    console.log(`EVENT-FIX received ${sourceChatId}:${sourceMessageId}`);
+
     if (!sourceExists.get(sourceChatId)) {
       console.log(`EVENT-FIX ignored chat ${sourceChatId}: not configured as source`);
       return;
@@ -159,6 +169,7 @@ try {
   async function install(client) {
     if (!client || installed.has(client)) return;
     installed.add(client);
+
     client.addEventHandler(async event => {
       try {
         if (event?.message && !event.message.groupedId) await processMessagesFix(client, [event.message]);
@@ -166,6 +177,7 @@ try {
         console.error("EVENT-FIX NewMessage ERROR:", error?.stack || error?.message || error);
       }
     }, new events.NewMessage({}));
+
     client.addEventHandler(async event => {
       try {
         const messages = (event?.messages || []).slice().sort((a, b) => idOf(a.id) - idOf(b.id));
@@ -174,17 +186,32 @@ try {
         console.error("EVENT-FIX Album ERROR:", error?.stack || error?.message || error);
       }
     }, new events.Album({}));
+
     console.log("Reliable MTProto forwarding handler installed.");
   }
 
+  // Install after connect/start, and also when the main core registers its own
+  // event handlers. The latter makes the fix independent of connection timing.
+  const originalAddEventHandler = TelegramClient.prototype.addEventHandler;
   const originalConnect = TelegramClient.prototype.connect;
+  const originalStart = TelegramClient.prototype.start;
+
+  TelegramClient.prototype.addEventHandler = function(callback, event) {
+    const result = originalAddEventHandler.call(this, callback, event);
+    try {
+      void install(this);
+    } catch (error) {
+      console.error("EVENT-FIX addEventHandler install error:", error?.stack || error?.message || error);
+    }
+    return result;
+  };
+
   TelegramClient.prototype.connect = async function(...args) {
     const result = await originalConnect.apply(this, args);
     try { await install(this); } catch (error) { console.error("EVENT-FIX install error:", error?.stack || error?.message || error); }
     return result;
   };
 
-  const originalStart = TelegramClient.prototype.start;
   TelegramClient.prototype.start = async function(...args) {
     const result = await originalStart.apply(this, args);
     try { await install(this); } catch (error) { console.error("EVENT-FIX start install error:", error?.stack || error?.message || error); }
