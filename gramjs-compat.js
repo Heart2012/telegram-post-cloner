@@ -1,6 +1,5 @@
 // GramJS 2.26.x compatibility shim.
-// The application uses `const { TelegramClient, events } = require("telegram")`,
-// while GramJS exposes event builders from `telegram/events`.
+// Expose event builders as `require("telegram").events` for legacy code.
 const Module = require("module");
 const path = require("path");
 const fs = require("fs");
@@ -20,19 +19,24 @@ const originalLoad = Module._load;
 Module._load = function(request, parent, isMain) {
   const mod = originalLoad.apply(this, arguments);
 
-  if (request === "telegram" && mod && !mod.events) {
-    const eventModule = originalLoad.call(this, "telegram/events", parent, isMain);
-
+  if (request === "telegram" && mod) {
+    let eventModule;
     try {
-      Object.defineProperty(mod, "events", {
-        value: eventModule,
-        enumerable: true,
-        configurable: true,
-        writable: true,
-      });
+      eventModule = originalLoad.call(this, "telegram/events", parent, isMain);
+    } catch (e) {
+      console.error("GramJS events compatibility load error:", e);
       return mod;
+    }
+
+    // Most GramJS versions return an extensible CommonJS export object.
+    // Assign directly first so destructuring `const { events } = require("telegram")`
+    // receives the event module.
+    try {
+      mod.events = eventModule;
+      if (mod.events === eventModule) return mod;
     } catch (_) {}
 
+    // Fallback for a non-extensible export object.
     return new Proxy(mod, {
       get(target, prop, receiver) {
         if (prop === "events") return eventModule;
