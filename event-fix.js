@@ -9,8 +9,11 @@ try {
   const { TelegramClient } = require("telegram");
   const events = require("telegram/events");
 
-  const persistentDir = path.join(process.env.HOME || process.cwd(), ".telegram-post-cloner");
-  const dbPath = process.env.DB_PATH || path.join(persistentDir, "cloner.db");
+  // IMPORTANT: do not name any local function `process`, because Node's global
+  // process object is needed here for environment variables.
+  const nodeProcess = globalThis.process;
+  const persistentDir = path.join(nodeProcess?.env?.HOME || nodeProcess?.cwd?.() || ".", ".telegram-post-cloner");
+  const dbPath = nodeProcess?.env?.DB_PATH || path.join(persistentDir, "cloner.db");
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new Database(dbPath);
 
@@ -24,19 +27,9 @@ try {
 
   const getSetting = db.prepare("SELECT value FROM settings WHERE key=?");
   const sourceExists = db.prepare("SELECT 1 FROM sources WHERE chat_id=?");
-  const destinationsFor = db.prepare(`
-    SELECT d.chat_id
-    FROM links l
-    JOIN sources s ON s.id=l.source_id
-    JOIN destinations d ON d.id=l.destination_id
-    WHERE s.chat_id=?
-    ORDER BY d.id
-  `);
+  const destinationsFor = db.prepare(`SELECT d.chat_id FROM links l JOIN sources s ON s.id=l.source_id JOIN destinations d ON d.id=l.destination_id WHERE s.chat_id=? ORDER BY d.id`);
   const alreadyCopied = db.prepare("SELECT 1 FROM copied WHERE source_chat_id=? AND source_message_id=? AND destination_chat_id=?");
-  const markCopied = db.prepare(`
-    INSERT OR IGNORE INTO copied(source_chat_id,source_message_id,destination_chat_id,destination_message_id)
-    VALUES(?,?,?,?)
-  `);
+  const markCopied = db.prepare(`INSERT OR IGNORE INTO copied(source_chat_id,source_message_id,destination_chat_id,destination_message_id) VALUES(?,?,?,?)`);
 
   const locks = new Map();
   const installed = new WeakSet();
@@ -55,8 +48,6 @@ try {
     return Number(value) || 0;
   }
 
-  // For channel messages GramJS can expose the channel ID as peerId.channelId,
-  // while older code may read chatId. The DB stores the raw Telegram entity ID.
   function messageChatId(message) {
     const peer = message?.peerId || message?.peerID;
     if (peer?.channelId !== undefined) return idOf(peer.channelId);
@@ -70,16 +61,10 @@ try {
     text = text || "";
     const lower = text.toLowerCase();
     const csv = value => String(value || "").split(",").map(x => x.trim()).filter(Boolean);
-
     if (csv(setting("ban_words")).some(word => lower.includes(word.toLowerCase()))) return null;
-
     const keywords = csv(setting("keywords"));
     if (keywords.length && !keywords.some(word => lower.includes(word.toLowerCase()))) return null;
-
-    if (setting("remove_links", "0") === "1") {
-      text = text.replace(/https?:\/\/\S+|(?:https?:\/\/)?t\.me\/\S+/gi, "");
-    }
-
+    if (setting("remove_links", "0") === "1") text = text.replace(/https?:\/\/\S+|(?:https?:\/\/)?t\.me\/\S+/gi, "");
     for (const line of setting("replacements", "").split(/\r?\n/)) {
       if (!line.includes("->")) continue;
       const p = line.indexOf("->");
@@ -87,7 +72,6 @@ try {
       const newText = line.slice(p + 2).trim();
       if (oldText) text = text.split(oldText).join(newText);
     }
-
     const signature = setting("signature", "");
     if (signature) text = text.trim() ? `${text.trim()}\n\n${signature}` : signature;
     return text.trim();
@@ -99,9 +83,8 @@ try {
     const current = new Promise(resolve => { release = resolve; });
     locks.set(destinationId, current);
     await previous;
-    try {
-      return await task();
-    } finally {
+    try { return await task(); }
+    finally {
       release();
       if (locks.get(destinationId) === current) locks.delete(destinationId);
     }
@@ -110,22 +93,13 @@ try {
   async function copyMessage(client, message, destination) {
     const text = transformText(message.message || "");
     if (text === null) return null;
-
-    if (message.media) {
-      return client.sendFile(destination, {
-        file: message.media,
-        caption: text || undefined,
-        forceDocument: false
-      });
-    }
-
+    if (message.media) return client.sendFile(destination, { file: message.media, caption: text || undefined, forceDocument: false });
     if (!text) return null;
     return client.sendMessage(destination, { message: text, linkPreview: false });
   }
 
-  async function process(client, messages) {
+  async function processMessagesFix(client, messages) {
     if (!client || !messages?.length) return;
-
     const first = messages[0];
     const sourceChatId = messageChatId(first);
     const sourceMessageId = idOf(first.id);
@@ -134,7 +108,6 @@ try {
       console.log(`EVENT-FIX skip: cannot determine peer/message ID (peer=${JSON.stringify(first.peerId || null)}, chat=${String(first.chatId || "")}, msg=${String(first.id || "")})`);
       return;
     }
-
     if (!sourceExists.get(sourceChatId)) {
       console.log(`EVENT-FIX ignored chat ${sourceChatId}: not configured as source`);
       return;
@@ -147,22 +120,18 @@ try {
     for (const row of rows) {
       const destinationChatId = idOf(row.chat_id);
       if (!destinationChatId) continue;
-
       const messageIds = messages.map(m => idOf(m.id)).filter(Boolean);
       if (messageIds.length && messageIds.every(mid => alreadyCopied.get(sourceChatId, mid, destinationChatId))) continue;
 
       await withLock(destinationChatId, async () => {
         const delay = Math.max(0, Math.min(3600, Number(setting("delay", "0")) || 0));
         if (delay) await new Promise(resolve => setTimeout(resolve, delay * 1000));
-
         try {
           const destination = await client.getEntity(destinationChatId);
           let sent;
-
           if (messages.length === 1) {
             sent = await copyMessage(client, messages[0], destination);
           } else {
-            // Keep album handling simple and reliable: send each media item in order.
             const sentItems = [];
             for (const message of messages) {
               const item = await copyMessage(client, message, destination);
@@ -170,18 +139,15 @@ try {
             }
             sent = sentItems;
           }
-
-          if (!sent) {
+          if (!sent || (Array.isArray(sent) && !sent.length)) {
             console.log(`EVENT-FIX filtered/empty ${sourceChatId}:${sourceMessageId}`);
             return;
           }
-
           const sentArray = Array.isArray(sent) ? sent : [sent];
           messages.forEach((message, index) => {
             const sentMessage = sentArray[index];
             if (sentMessage) markCopied.run(sourceChatId, idOf(message.id), destinationChatId, idOf(sentMessage.id));
           });
-
           console.log(`EVENT-FIX COPIED ${sourceChatId}:${messages.map(m => idOf(m.id)).join(",")} -> ${destinationChatId}`);
         } catch (error) {
           console.error(`EVENT-FIX COPY ERROR ${sourceChatId} -> ${destinationChatId}:`, error?.stack || error?.message || error);
@@ -193,24 +159,21 @@ try {
   async function install(client) {
     if (!client || installed.has(client)) return;
     installed.add(client);
-
     client.addEventHandler(async event => {
       try {
-        if (event?.message && !event.message.groupedId) await process(client, [event.message]);
+        if (event?.message && !event.message.groupedId) await processMessagesFix(client, [event.message]);
       } catch (error) {
         console.error("EVENT-FIX NewMessage ERROR:", error?.stack || error?.message || error);
       }
     }, new events.NewMessage({}));
-
     client.addEventHandler(async event => {
       try {
         const messages = (event?.messages || []).slice().sort((a, b) => idOf(a.id) - idOf(b.id));
-        if (messages.length) await process(client, messages);
+        if (messages.length) await processMessagesFix(client, messages);
       } catch (error) {
         console.error("EVENT-FIX Album ERROR:", error?.stack || error?.message || error);
       }
     }, new events.Album({}));
-
     console.log("Reliable MTProto forwarding handler installed.");
   }
 
@@ -221,7 +184,6 @@ try {
     return result;
   };
 
-  // start() may establish the connection internally; add a defensive hook too.
   const originalStart = TelegramClient.prototype.start;
   TelegramClient.prototype.start = async function(...args) {
     const result = await originalStart.apply(this, args);
