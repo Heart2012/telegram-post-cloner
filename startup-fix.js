@@ -113,12 +113,12 @@ try {
     const copy = { ...extra };
     const markup = extra.reply_markup;
     if (Array.isArray(markup.keyboard)) {
-      let keyboard = markup.keyboard.map(row => row.map(button =>
+      const containsLanguageChoice = markup.keyboard.some(row => row.some(button => button === "🇺🇦 Українська" || button === "🇷🇺 Русский"));
+      if (containsLanguageChoice) return copy;
+      const keyboard = markup.keyboard.map(row => row.map(button =>
         typeof button === "string" ? translate(button, lang) : button
       ));
-      const languageButton = "🌐 Мова / Язык";
-      keyboard = keyboard.filter(row => !row.some(button => button === "🇺🇦 Українська" || button === "🇷🇺 Русский" || button === "↩️ Назад"));
-      if (!keyboard.some(row => row.some(button => button === languageButton))) keyboard.push([languageButton]);
+      if (!keyboard.some(row => row.some(button => button === "🌐 Мова / Язык"))) keyboard.push(["🌐 Мова / Язык"]);
       copy.reply_markup = { ...markup, keyboard };
     }
     return copy;
