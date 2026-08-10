@@ -1,11 +1,9 @@
 // Hostinger startup guard.
-// The latest MTProto session is persisted in the SQLite database.
-// Ignore a legacy MT_SESSION environment variable so an old session
-// cannot override the freshly authorized session stored in the DB.
-if (process.env.MT_SESSION) {
-  console.log("Ignoring legacy MT_SESSION environment variable; using persistent DB session.");
-  delete process.env.MT_SESSION;
-}
+// The MTProto session is persisted in the SQLite database after authorization.
+// Keep MT_SESSION as a fallback: if the database does not contain a session
+// (for example after a fresh deployment), index.js can restore the account
+// from the environment variable and then save the current session into DB.
+// Do NOT delete MT_SESSION here.
 
 // Ukrainian interface layer.
 // index.js contains the original Russian UI text. This layer translates
