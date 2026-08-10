@@ -138,8 +138,6 @@ bot.command("auth",async ctx=>{await beginLogin();const url=AUTH_URL?`${AUTH_URL
 bot.command("cancel",ctx=>{state.delete(ctx.from.id);return ctx.reply("❌ Скасовано.",keyboard());});
 bot.command("status",async ctx=>{if(!client)return ctx.reply(`❌ Telegram не авторизований.\n\n${telegramError||"Використай /auth."}`);try{const me=await client.getMe();return ctx.reply(`✅ Telegram авторизований.\nID: ${me.id}\nUsername: @${me.username||"—"}`);}catch(e){return ctx.reply(`❌ Помилка: ${e.message||e}`);}});
 
-appPlaceholder: null;
-
 const app=express();
 app.use(express.urlencoded({extended:false}));
 app.get("/",(req,res)=>res.status(200).send("Telegram Post Cloner is running."));
