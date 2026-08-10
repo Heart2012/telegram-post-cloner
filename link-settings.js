@@ -1,4 +1,6 @@
 const path = require("path");
+const fs = require("fs");
+const Module = require("module");
 const Database = require("better-sqlite3");
 const { Composer, Markup } = require("telegraf");
 
@@ -16,6 +18,75 @@ db.exec(`CREATE TABLE IF NOT EXISTS link_settings(
   signature TEXT DEFAULT '',
   replacements TEXT DEFAULT ''
 );`);
+
+// Apply per-link settings to the existing cloner without duplicating index.js.
+// index.js is transformed only when it is loaded, and all existing features remain intact.
+if (!Module._extensions.__linkSettingsLoader) {
+  const originalLoader = Module._extensions[".js"];
+  const loader = function(module, filename) {
+    if (path.basename(filename) !== "index.js") return originalLoader(module, filename);
+
+    let source = fs.readFileSync(filename, "utf8");
+
+    source = source.replace(
+      'const destFor=db.prepare(`SELECT d.chat_id FROM links l JOIN sources s ON s.id=l.source_id JOIN destinations d ON d.id=l.destination_id WHERE s.chat_id=? ORDER BY d.id`);',
+      'const destFor=db.prepare(`SELECT l.id link_id,d.chat_id FROM links l JOIN sources s ON s.id=l.source_id JOIN destinations d ON d.id=l.destination_id WHERE s.chat_id=? ORDER BY d.id`);'
+    );
+
+    const marker = 'const sources=()=>db.prepare("SELECT id,chat_id,title,username FROM sources ORDER BY id").all();';
+    const helpers = `
+function getLinkSetting(linkId,key,fallback=""){
+  try{
+    db.prepare("INSERT OR IGNORE INTO link_settings(link_id) VALUES(?)").run(linkId);
+    const allowed=new Set(["enabled","remove_links","delay","keywords","ban_words","signature","replacements"]);
+    if(!allowed.has(key)) return fallback;
+    const row=db.prepare(\`SELECT \${key} value FROM link_settings WHERE link_id=?\`).get(linkId);
+    if(row&&row.value!==null&&row.value!==undefined&&String(row.value)!=="") return String(row.value);
+  }catch(e){ console.error("Link settings read error:",e?.message||e); }
+  return fallback;
+}
+function linkTransformText(linkId,text){
+  text=text||"";
+  const globalBan=csv(getSetting("ban_words"));
+  const globalKeys=csv(getSetting("keywords"));
+  const ban=csv(getLinkSetting(linkId,"ban_words",getSetting("ban_words","")));
+  const keys=csv(getLinkSetting(linkId,"keywords",getSetting("keywords","")));
+  if(ban.some(w=>text.toLowerCase().includes(w.toLowerCase()))) return null;
+  if(keys.length&&!keys.some(w=>text.toLowerCase().includes(w.toLowerCase()))) return null;
+  if(getLinkSetting(linkId,"remove_links",getSetting("remove_links","0"))==="1") text=text.replace(/https?:\\/\\/\\S+|(?:https?:\\/\\/)?t\\.me\\/\\S+/gi,"");
+  const replacements=getLinkSetting(linkId,"replacements",getSetting("replacements",""));
+  for(const line of replacements.split(/\\r?\\n/)){
+    if(!line.includes("->")) continue;
+    const a=line.indexOf("->"),old=line.slice(0,a).trim(),neu=line.slice(a+2).trim();
+    if(old) text=text.split(old).join(neu);
+  }
+  const sig=getLinkSetting(linkId,"signature",getSetting("signature",""));
+  if(sig) text=text.trim()?\`${text.trim()}\\n\\n\${sig}\`:sig;
+  return text.trim();
+}
+`;
+    if (!source.includes("function getLinkSetting(linkId,key,fallback=\"\")")) {
+      source = source.replace(marker, helpers + "\n" + marker);
+    }
+
+    source = source.replace(
+      'async function copyOne(message,destination){const text=transformText(message.message||"");',
+      'async function copyOne(message,destination,linkId){const text=linkTransformText(linkId,message.message||"");'
+    );
+    source = source.replace(
+      'async function copyAlbum(messages,destination){const items=[];for(const m of messages){const text=transformText(m.message||"");',
+      'async function copyAlbum(messages,destination,linkId){const items=[];for(const m of messages){const text=linkTransformText(linkId,m.message||"");'
+    );
+
+    const oldProcess = 'for(const row of destFor.all(sourceChatId)){const destinationChatId=row.chat_id;if(messages.every(m=>!!copied.get(sourceChatId,Number(m.id),destinationChatId)))continue;await enqueue(destinationChatId,async()=>{const delay=Math.max(0,Math.min(3600,Number(getSetting("delay","0"))||0));if(delay)await new Promise(r=>setTimeout(r,delay*1000));try{const destination=await client.getEntity(destinationChatId);const sent=messages.length>1?await copyAlbum(messages,destination):await copyOne(messages[0],destination);';
+    const newProcess = 'for(const row of destFor.all(sourceChatId)){const destinationChatId=row.chat_id;const linkId=Number(row.link_id);if(getLinkSetting(linkId,"enabled","1")!=="1")continue;if(messages.every(m=>!!copied.get(sourceChatId,Number(m.id),destinationChatId)))continue;await enqueue(destinationChatId,async()=>{const delay=Math.max(0,Math.min(3600,Number(getLinkSetting(linkId,"delay",getSetting("delay","0")))||0));if(delay)await new Promise(r=>setTimeout(r,delay*1000));try{const destination=await client.getEntity(destinationChatId);const sent=messages.length>1?await copyAlbum(messages,destination,linkId):await copyOne(messages[0],destination,linkId);';
+    source = source.replace(oldProcess,newProcess);
+
+    module._compile(source, filename);
+  };
+  Module._extensions[".js"] = loader;
+  Module._extensions.__linkSettingsLoader = true;
+}
 
 const state = new Map();
 const defaults = {enabled:"1",remove_links:"0",delay:"0",keywords:"",ban_words:"",signature:"",replacements:""};
