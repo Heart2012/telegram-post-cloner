@@ -1,12 +1,12 @@
 // Reliable MTProto forwarding layer.
-// Handles GramJS channel peer IDs and forwards new messages to linked destinations.
+// Primary transport is polling via GramJS getMessages.
+// This does not depend on Telegram update events, which can be unreliable on some hosting setups.
 
 try {
   const fs = require("fs");
   const path = require("path");
   const Database = require("better-sqlite3");
   const { TelegramClient } = require("telegram");
-  const events = require("telegram/events");
 
   const nodeProcess = globalThis.process;
   const persistentDir = path.join(nodeProcess?.env?.HOME || nodeProcess?.cwd?.() || ".", ".telegram-post-cloner");
@@ -23,19 +23,17 @@ try {
   `);
 
   const getSetting = db.prepare("SELECT value FROM settings WHERE key=?");
+  const sourceRows = db.prepare("SELECT chat_id,title,username FROM sources ORDER BY id");
   const sourceExists = db.prepare("SELECT 1 FROM sources WHERE chat_id=?");
   const destinationsFor = db.prepare(`SELECT d.chat_id FROM links l JOIN sources s ON s.id=l.source_id JOIN destinations d ON d.id=l.destination_id WHERE s.chat_id=? ORDER BY d.id`);
   const alreadyCopied = db.prepare("SELECT 1 FROM copied WHERE source_chat_id=? AND source_message_id=? AND destination_chat_id=?");
   const markCopied = db.prepare(`INSERT OR IGNORE INTO copied(source_chat_id,source_message_id,destination_chat_id,destination_message_id) VALUES(?,?,?,?)`);
 
   const locks = new Map();
-  const installed = new WeakSet();
+  const lastSeen = new Map();
+  const pollingClients = new WeakSet();
 
-  function setting(key, fallback = "") {
-    const row = getSetting.get(key);
-    return row ? row.value : fallback;
-  }
-
+  function setting(key, fallback = "") { const row = getSetting.get(key); return row ? row.value : fallback; }
   function idOf(value) {
     if (value === null || value === undefined) return 0;
     if (typeof value === "bigint") return Number(value);
@@ -44,16 +42,7 @@ try {
     if (value.value !== undefined) return Number(value.value) || 0;
     return Number(value) || 0;
   }
-
-  // GramJS exposes Api.PeerChannel.channelId as the positive channel ID,
-  // while the database/UI stores Telegram peer IDs as -100xxxxxxxxxx.
-  // Example: channelId 2151348418 -> -1002151348418.
-  function channelPeerId(value) {
-    const id = idOf(value);
-    if (!id) return 0;
-    return -1000000000000 - id;
-  }
-
+  function channelPeerId(value) { const id = idOf(value); return id ? -1000000000000 - id : 0; }
   function messageChatId(message) {
     const peer = message?.peerId || message?.peerID;
     if (peer?.channelId !== undefined) return channelPeerId(peer.channelId);
@@ -63,7 +52,6 @@ try {
     if (message?.chatID !== undefined) return idOf(message.chatID);
     return 0;
   }
-
   function transformText(text) {
     text = text || "";
     const lower = text.toLowerCase();
@@ -83,142 +71,93 @@ try {
     if (signature) text = text.trim() ? `${text.trim()}\n\n${signature}` : signature;
     return text.trim();
   }
-
   async function withLock(destinationId, task) {
     const previous = locks.get(destinationId) || Promise.resolve();
     let release;
     const current = new Promise(resolve => { release = resolve; });
     locks.set(destinationId, current);
     await previous;
-    try { return await task(); }
-    finally {
-      release();
-      if (locks.get(destinationId) === current) locks.delete(destinationId);
-    }
+    try { return await task(); } finally { release(); if (locks.get(destinationId) === current) locks.delete(destinationId); }
   }
-
-  async function copyMessage(client, message, destination) {
+  async function copyOne(client, message, destination) {
     const text = transformText(message.message || "");
     if (text === null) return null;
     if (message.media) return client.sendFile(destination, { file: message.media, caption: text || undefined, forceDocument: false });
     if (!text) return null;
     return client.sendMessage(destination, { message: text, linkPreview: false });
   }
-
-  async function processMessagesFix(client, messages) {
+  async function processMessages(client, messages) {
     if (!client || !messages?.length) return;
-    const first = messages[0];
-    const sourceChatId = messageChatId(first);
-    const sourceMessageId = idOf(first.id);
-
-    if (!sourceChatId || !sourceMessageId) {
-      console.log(`EVENT-FIX skip: cannot determine peer/message ID (peer=${JSON.stringify(first.peerId || null)}, chat=${String(first.chatId || "")}, msg=${String(first.id || "")})`);
-      return;
-    }
-
-    console.log(`EVENT-FIX received ${sourceChatId}:${sourceMessageId}`);
-
-    if (!sourceExists.get(sourceChatId)) {
-      console.log(`EVENT-FIX ignored chat ${sourceChatId}: not configured as source`);
-      return;
-    }
-
+    const sourceChatId = messageChatId(messages[0]);
+    const ids = messages.map(m => idOf(m.id)).filter(Boolean);
+    if (!sourceChatId) { console.log(`FORWARDER skip: unknown source peer for ${ids.join(",")}`); return; }
+    console.log(`FORWARDER received ${sourceChatId}:${ids.join(",")}`);
+    if (!sourceExists.get(sourceChatId)) { console.log(`FORWARDER ignored ${sourceChatId}: not configured as source`); return; }
     const rows = destinationsFor.all(sourceChatId);
-    console.log(`EVENT-FIX message ${sourceChatId}:${sourceMessageId}; destinations=${rows.length}`);
-    if (!rows.length) return;
-
+    console.log(`FORWARDER destinations for ${sourceChatId}: ${rows.length}`);
     for (const row of rows) {
       const destinationChatId = idOf(row.chat_id);
-      if (!destinationChatId) continue;
-      const messageIds = messages.map(m => idOf(m.id)).filter(Boolean);
-      if (messageIds.length && messageIds.every(mid => alreadyCopied.get(sourceChatId, mid, destinationChatId))) continue;
-
+      if (!destinationChatId || ids.every(mid => alreadyCopied.get(sourceChatId, mid, destinationChatId))) continue;
       await withLock(destinationChatId, async () => {
         const delay = Math.max(0, Math.min(3600, Number(setting("delay", "0")) || 0));
         if (delay) await new Promise(resolve => setTimeout(resolve, delay * 1000));
         try {
           const destination = await client.getEntity(destinationChatId);
-          let sent;
-          if (messages.length === 1) {
-            sent = await copyMessage(client, messages[0], destination);
-          } else {
-            const sentItems = [];
-            for (const message of messages) {
-              const item = await copyMessage(client, message, destination);
-              if (item) sentItems.push(item);
-            }
-            sent = sentItems;
-          }
-          if (!sent || (Array.isArray(sent) && !sent.length)) {
-            console.log(`EVENT-FIX filtered/empty ${sourceChatId}:${sourceMessageId}`);
-            return;
-          }
-          const sentArray = Array.isArray(sent) ? sent : [sent];
-          messages.forEach((message, index) => {
-            const sentMessage = sentArray[index];
-            if (sentMessage) markCopied.run(sourceChatId, idOf(message.id), destinationChatId, idOf(sentMessage.id));
-          });
-          console.log(`EVENT-FIX COPIED ${sourceChatId}:${messages.map(m => idOf(m.id)).join(",")} -> ${destinationChatId}`);
-        } catch (error) {
-          console.error(`EVENT-FIX COPY ERROR ${sourceChatId} -> ${destinationChatId}:`, error?.stack || error?.message || error);
-        }
+          const sent = [];
+          for (const message of messages) { const result = await copyOne(client, message, destination); if (result) sent.push(result); }
+          if (!sent.length) { console.log(`FORWARDER filtered/empty ${sourceChatId}:${ids.join(",")}`); return; }
+          messages.forEach((message, index) => { if (sent[index]) markCopied.run(sourceChatId, idOf(message.id), destinationChatId, idOf(sent[index].id)); });
+          console.log(`FORWARDER COPIED ${sourceChatId}:${ids.join(",")} -> ${destinationChatId}`);
+        } catch (error) { console.error(`FORWARDER COPY ERROR ${sourceChatId} -> ${destinationChatId}:`, error?.stack || error?.message || error); }
       });
     }
   }
-
-  async function install(client) {
-    if (!client || installed.has(client)) return;
-    installed.add(client);
-
-    client.addEventHandler(async event => {
-      try {
-        if (event?.message && !event.message.groupedId) await processMessagesFix(client, [event.message]);
-      } catch (error) {
-        console.error("EVENT-FIX NewMessage ERROR:", error?.stack || error?.message || error);
+  async function pollSource(client, row) {
+    const sourceChatId = idOf(row.chat_id);
+    const entityRef = row.username ? `@${row.username}` : sourceChatId;
+    try {
+      const entity = await client.getEntity(entityRef);
+      const newest = await client.getMessages(entity, { limit: 1 });
+      if (!newest?.length) return;
+      const newestId = idOf(newest[0].id);
+      const previousId = lastSeen.get(sourceChatId);
+      if (previousId === undefined) {
+        lastSeen.set(sourceChatId, newestId);
+        console.log(`FORWARDER watching source ${sourceChatId} (${row.title}); starting at message ${newestId}`);
+        return;
       }
-    }, new events.NewMessage({}));
-
-    client.addEventHandler(async event => {
-      try {
-        const messages = (event?.messages || []).slice().sort((a, b) => idOf(a.id) - idOf(b.id));
-        if (messages.length) await processMessagesFix(client, messages);
-      } catch (error) {
-        console.error("EVENT-FIX Album ERROR:", error?.stack || error?.message || error);
-      }
-    }, new events.Album({}));
-
-    console.log("Reliable MTProto forwarding handler installed.");
+      if (newestId <= previousId) return;
+      const messages = await client.getMessages(entity, { minId: previousId, maxId: newestId, limit: Math.min(100, Math.max(1, newestId - previousId)) });
+      const fresh = (messages || []).filter(m => idOf(m.id) > previousId && idOf(m.id) <= newestId).sort((a,b) => idOf(a.id) - idOf(b.id));
+      lastSeen.set(sourceChatId, newestId);
+      if (!fresh.length) return;
+      console.log(`FORWARDER found ${fresh.length} new message(s) in ${sourceChatId}`);
+      for (const message of fresh) await processMessages(client, [message]);
+    } catch (error) { console.error(`FORWARDER POLL ERROR ${sourceChatId}:`, error?.stack || error?.message || error); }
   }
-
-  // Install after connect/start, and also when the main core registers its own
-  // event handlers. The latter makes the fix independent of connection timing.
-  const originalAddEventHandler = TelegramClient.prototype.addEventHandler;
+  async function startPolling(client) {
+    if (!client || pollingClients.has(client)) return;
+    pollingClients.add(client);
+    console.log("FORWARDER polling started (2s interval).");
+    const loop = async () => {
+      try { for (const row of sourceRows.all()) await pollSource(client, row); }
+      catch (error) { console.error("FORWARDER polling loop error:", error?.stack || error?.message || error); }
+      setTimeout(loop, 2000);
+    };
+    await loop();
+  }
+  const installedClients = new WeakSet();
+  async function install(client) {
+    if (!client || installedClients.has(client)) return;
+    installedClients.add(client);
+    console.log("Reliable MTProto forwarding handler installed.");
+    try { await client.getMe(); console.log("FORWARDER Telegram client ready."); }
+    catch (error) { console.error("FORWARDER client readiness error:", error?.stack || error?.message || error); }
+    void startPolling(client);
+  }
   const originalConnect = TelegramClient.prototype.connect;
   const originalStart = TelegramClient.prototype.start;
-
-  TelegramClient.prototype.addEventHandler = function(callback, event) {
-    const result = originalAddEventHandler.call(this, callback, event);
-    try {
-      void install(this);
-    } catch (error) {
-      console.error("EVENT-FIX addEventHandler install error:", error?.stack || error?.message || error);
-    }
-    return result;
-  };
-
-  TelegramClient.prototype.connect = async function(...args) {
-    const result = await originalConnect.apply(this, args);
-    try { await install(this); } catch (error) { console.error("EVENT-FIX install error:", error?.stack || error?.message || error); }
-    return result;
-  };
-
-  TelegramClient.prototype.start = async function(...args) {
-    const result = await originalStart.apply(this, args);
-    try { await install(this); } catch (error) { console.error("EVENT-FIX start install error:", error?.stack || error?.message || error); }
-    return result;
-  };
-
+  TelegramClient.prototype.connect = async function(...args) { const result = await originalConnect.apply(this, args); try { await install(this); } catch (error) { console.error("FORWARDER install error:", error?.stack || error?.message || error); } return result; };
+  TelegramClient.prototype.start = async function(...args) { const result = await originalStart.apply(this, args); try { await install(this); } catch (error) { console.error("FORWARDER start install error:", error?.stack || error?.message || error); } return result; };
   console.log("Telegram peer-ID forwarding fix loaded.");
-} catch (error) {
-  console.error("Telegram peer-ID forwarding fix failed to load:", error?.stack || error?.message || error);
-}
+} catch (error) { console.error("Telegram peer-ID forwarding fix failed to load:", error?.stack || error?.message || error); }
