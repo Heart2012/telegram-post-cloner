@@ -9,8 +9,6 @@ const { TelegramClient } = require("telegram");
 const events = require("telegram/events");
 const { StringSession } = require("telegram/sessions");
 
-// Hostinger creates a new deployment/version directory on every redeploy.
-// Keep SQLite (and the saved MTProto session) in the persistent HOME directory.
 if (!process.env.DB_PATH) {
   const persistentDir = path.join(process.env.HOME || process.cwd(), ".telegram-post-cloner");
   try { fs.mkdirSync(persistentDir, { recursive: true }); } catch (_) {}
@@ -97,6 +95,32 @@ async function resolve(value){
 async function info(entity){const id=Number(entity.id?.value??entity.id);const title=entity.title||[entity.firstName,entity.lastName].filter(Boolean).join(" ")||String(id);return{id,title,username:entity.username||null};}
 async function add(value,table){if(!client)throw new Error("Telegram ещё не авторизован. Открой /auth.");const x=await info(await resolve(value));const sql=table==="sources"?`INSERT INTO sources(chat_id,title,username) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,username=excluded.username`:`INSERT INTO destinations(chat_id,title,username) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,username=excluded.username`;db.prepare(sql).run(x.id,x.title,x.username);return x;}
 
+function forwardedChatFromMessage(message){
+  const origin=message?.forward_origin;
+  if(origin?.type==="channel" && origin.chat) return origin.chat;
+  if(origin?.type==="chat" && origin.sender_chat) return origin.sender_chat;
+  if(message?.forward_from_chat) return message.forward_from_chat;
+  return null;
+}
+
+async function addForwardedChat(message,table){
+  if(!client)throw new Error("Telegram ещё не авторизован. Открой /auth.");
+  const chat=forwardedChatFromMessage(message);
+  if(!chat)throw new Error("Не удалось определить источник пересланного сообщения. Перешли сообщение именно из канала/группы.");
+  const id=Number(chat.id);
+  if(!id)throw new Error("Не удалось определить ID чата.");
+  let title=chat.title||chat.username||String(id);
+  let username=chat.username||null;
+  try{
+    const entity=await client.getEntity(id);
+    title=entity.title||title;
+    username=entity.username||username||null;
+  }catch(_){}
+  const sql=table==="sources"?`INSERT INTO sources(chat_id,title,username) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,username=excluded.username`:`INSERT INTO destinations(chat_id,title,username) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,username=excluded.username`;
+  db.prepare(sql).run(id,title,username);
+  return {id,title,username};
+}
+
 async function copyOne(message,destination){const text=transformText(message.message||"");if(text===null)return null;if(message.media)return await client.sendFile(destination,{file:message.media,caption:text||undefined,forceDocument:false});if(!text)return null;return await client.sendMessage(destination,{message:text,linkPreview:false});}
 async function copyAlbum(messages,destination){const items=[];for(const m of messages){const text=transformText(m.message||"");if(text===null)return null;if(m.media)items.push({file:m.media,caption:text||undefined});}if(!items.length)return null;return await client.sendFile(destination,items);}
 async function enqueue(chatId,task){const previous=locks.get(chatId)||Promise.resolve();let release;const current=new Promise(r=>release=r);locks.set(chatId,current);await previous;try{return await task();}finally{release();if(locks.get(chatId)===current)locks.delete(chatId);}}
@@ -130,8 +154,6 @@ function setupHandlers(){
 
 async function connectSavedSession(){
   if(telegramStarting||client)return;
-  // Always prefer the DB session. This prevents an old MT_SESSION env value
-  // from overriding the freshly authorized session.
   const saved=getSetting("mtproto_session","") || MT_SESSION;
   if(!saved)return;
   telegramStarting=true;telegramError="";
@@ -153,7 +175,6 @@ async function connectSavedSession(){
     telegramError=e?.message||String(e);
     console.error("Session restore error:",e);
     if(c){try{await c.disconnect();}catch(_) {}}
-    // A revoked/invalid auth key must not be retried forever.
     if(/AUTH_KEY_UNREGISTERED|SESSION_REVOKED|SESSION_EXPIRED/i.test(String(e?.message||e))) clearSetting("mtproto_session");
   }finally{telegramStarting=false;}
 }
@@ -170,7 +191,6 @@ async function beginLogin(){
     phoneCode:async()=>waitAuth("code"),
     onError:e=>console.error("Telegram auth:",e)
   }).then(async()=>{
-    // Save the session immediately after Telegram confirms the login.
     const session=c.session.save();
     setSetting("mtproto_session",session);
     const me=await c.getMe();
@@ -194,8 +214,8 @@ bot.command("cancel",ctx=>{state.delete(ctx.from.id);return ctx.reply("❌ От�
 bot.command("id",ctx=>ctx.reply(`Ваш ID: ${ctx.from.id}`));
 bot.command("status",async ctx=>{if(!client)return ctx.reply("❌ Telegram не авторизован.");try{const me=await client.getMe();return ctx.reply(`✅ Telegram авторизован.\nID: ${me.id}\nUsername: @${me.username||"—"}`);}catch(e){return ctx.reply(`❌ Ошибка: ${e.message||e}`);}});
 bot.command("session",ctx=>{if(!client)return ctx.reply("❌ Telegram не авторизован.");const session=client.session?.save?.()||"";if(!session)return ctx.reply("❌ Session недоступна.");return ctx.reply(`🔐 MT_SESSION\n\n${session}\n\n⚠️ Секретная строка. Не отправляй её другим людям и после копирования удали это сообщение.`,{protect_content:true});});
-bot.hears("📥 Источники",ctx=>{let t="📥 Источники\n\n";for(const r of sources())t+=`${r.id}. ${r.title} — ${r.username||r.chat_id}\n`;if(!sources().length)t+="Нет источников.\n";state.set(ctx.from.id,"source");return ctx.reply(t+"\nОтправь @username или ссылку.\n/cancel");});
-bot.hears("📤 Приёмники",ctx=>{let t="📤 Приёмники\n\n";for(const r of destinations())t+=`${r.id}. ${r.title} — ${r.username||r.chat_id}\n`;if(!destinations().length)t+="Нет приёмников.\n";state.set(ctx.from.id,"destination");return ctx.reply(t+"\nОтправь @username или ссылку.\n/cancel");});
+bot.hears("📥 Источники",ctx=>{let t="📥 Источники\n\n";for(const r of sources())t+=`${r.id}. ${r.title} — ${r.username||r.chat_id}\n`;if(!sources().length)t+="Нет источников.\n";state.set(ctx.from.id,"source");return ctx.reply(t+"\nМожешь отправить @username или ссылку.\nИли просто ПЕРЕШЛИ сюда любое сообщение из нужного канала.\n/cancel");});
+bot.hears("📤 Приёмники",ctx=>{let t="📤 Приёмники\n\n";for(const r of destinations())t+=`${r.id}. ${r.title} — ${r.username||r.chat_id}\n`;if(!destinations().length)t+="Нет приёмников.\n";state.set(ctx.from.id,"destination");return ctx.reply(t+"\nМожешь отправить @username или ссылку.\nИли просто ПЕРЕШЛИ сюда любое сообщение из нужного канала.\n/cancel");});
 bot.hears("🔗 Связки",ctx=>{let t="🔗 Связки\n\n";for(const r of links())t+=`${r.id}. ${r.source_title} → ${r.destination_title}\n`;if(!links().length)t+="Нет связок.\n";state.set(ctx.from.id,"link");return ctx.reply(t+"\nСоздать: 1 2\nУдалить: /unlink ID");});
 bot.command("unlink",ctx=>{const id=Number((ctx.message.text||"").split(/\s+/)[1]);if(!Number.isInteger(id))return ctx.reply("Формат: /unlink 3");db.prepare("DELETE FROM links WHERE id=?").run(id);return ctx.reply(`✅ Связка ${id} удалена.`);});
 bot.hears("⚙️ Настройки",ctx=>ctx.reply(`⚙️ Настройки\nУдалять ссылки: ${getSetting("remove_links","0")==="1"?"🟢":"🔴"}\nЗадержка: ${getSetting("delay","0")} сек.\nБелый фильтр: ${getSetting("keywords","нет")}\nЧёрный фильтр: ${getSetting("ban_words","нет")}\nПодпись: ${getSetting("signature","нет")}\nЗамены: ${getSetting("replacements","нет")}\n\n/links_on\n/links_off\n/delay 5\n/delay_clear\n/signature Текст\n/signature_clear\n/keywords слово1, слово2\n/keywords_clear\n/ban_words слово1, слово2\n/ban_words_clear\n/replace старое -> новое\n/replace_clear`));
@@ -213,6 +233,24 @@ bot.command("replace",ctx=>{const v=(ctx.message.text||"").split(" ").slice(1).j
 bot.command("replace_clear",ctx=>{clearSetting("replacements");return ctx.reply("✅ Замены очищены.");});
 bot.hears("📊 Статистика",ctx=>{const c=t=>db.prepare(`SELECT COUNT(*) c FROM ${t}`).get().c;return ctx.reply(`📊 Статистика\n\n📥 Источников: ${c("sources")}\n📤 Приёмников: ${c("destinations")}\n🔗 Связок: ${c("links")}\n📨 Скопировано: ${c("copied")}`);});
 bot.hears("❓ Помощь",ctx=>ctx.reply("❓ Добавь источник, приёмник и связку. После этого новые посты копируются автоматически.\n\n/status — статус Telegram\n/session — получить MT_SESSION для Hostinger"));
+
+// Forwarded messages can be used instead of typing @username or a link.
+// Works for channel/group forwards and for media posts as well.
+bot.on("message",async(ctx,next)=>{
+  const s=state.get(ctx.from.id);
+  if(s!=="source"&&s!=="destination")return next();
+  const chat=forwardedChatFromMessage(ctx.message);
+  if(!chat)return next();
+  try{
+    const x=await addForwardedChat(ctx.message,s==="source"?"sources":"destinations");
+    state.delete(ctx.from.id);
+    const label=s==="source"?"Источник":"Приёмник";
+    return ctx.reply(`✅ ${label} добавлен.\n\n📌 ${x.title}\n🆔 ${x.id}${x.username?`\n👤 @${x.username}`:""}`,keyboard());
+  }catch(e){
+    return ctx.reply(`❌ ${e.message||e}`);
+  }
+});
+
 bot.on("text",async ctx=>{const s=state.get(ctx.from.id),v=(ctx.message.text||"").trim();if(!s||!v||v.startsWith("/"))return;try{if(s==="source"){const x=await add(v,"sources");state.delete(ctx.from.id);return ctx.reply(`✅ Источник добавлен.\n${x.title}\nID: ${x.id}`,keyboard());}if(s==="destination"){const x=await add(v,"destinations");state.delete(ctx.from.id);return ctx.reply(`✅ Приёмник добавлен.\n${x.title}\nID: ${x.id}`,keyboard());}if(s==="link"){const p=v.split(/\s+/);if(p.length!==2||!p.every(x=>/^\d+$/.test(x)))return ctx.reply("Формат: 1 2");if(!db.prepare("SELECT 1 FROM sources WHERE id=?").get(Number(p[0])))return ctx.reply("❌ Источник не найден.");if(!db.prepare("SELECT 1 FROM destinations WHERE id=?").get(Number(p[1])))return ctx.reply("❌ Приёмник не найден.");db.prepare("INSERT OR IGNORE INTO links(source_id,destination_id) VALUES(?,?)").run(Number(p[0]),Number(p[1]));state.delete(ctx.from.id);return ctx.reply("✅ Связка создана.",keyboard());}}catch(e){return ctx.reply(`❌ ${e.message||e}`);}});
 bot.catch(e=>console.error("Bot error:",e));
 
