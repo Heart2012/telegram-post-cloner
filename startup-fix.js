@@ -1,15 +1,26 @@
-// Hostinger startup guard.
-// The MTProto session is persisted in the SQLite database after authorization.
-// Keep MT_SESSION as a fallback: if the database does not contain a session
-// (for example after a fresh deployment), index.js can restore the account
-// from the environment variable and then save the current session into DB.
-// Do NOT delete MT_SESSION here.
+// Hostinger startup guard + per-user Russian/Ukrainian interface.
+// The cloner logic in index.js is intentionally left unchanged.
+// Language preference is stored separately in ~/.telegram-post-cloner/languages.json.
 
-// Ukrainian interface layer.
-// index.js contains the original Russian UI text. This layer translates
-// outgoing bot messages and keyboard buttons without changing the cloner logic.
 try {
-  const { Context, Markup } = require("telegraf");
+  const fs = require("fs");
+  const path = require("path");
+  const { Context, Markup, Composer } = require("telegraf");
+
+  const persistentDir = path.join(process.env.HOME || process.cwd(), ".telegram-post-cloner");
+  fs.mkdirSync(persistentDir, { recursive: true });
+  const LANG_FILE = path.join(persistentDir, "languages.json");
+
+  let languages = {};
+  try { languages = JSON.parse(fs.readFileSync(LANG_FILE, "utf8")) || {}; } catch (_) { languages = {}; }
+  const saveLanguages = () => {
+    try { fs.writeFileSync(LANG_FILE, JSON.stringify(languages, null, 2), "utf8"); } catch (_) {}
+  };
+
+  const ADMIN_IDS = new Set((process.env.ADMIN_IDS || "").split(",").map(x => x.trim()).filter(Boolean).map(Number));
+  const isAdmin = id => ADMIN_IDS.has(Number(id));
+  const getLang = id => languages[String(id)] === "ru" ? "ru" : "uk";
+  const setLang = (id, lang) => { languages[String(id)] = lang === "ru" ? "ru" : "uk"; saveLanguages(); };
 
   const replacements = [
     ["Заполни API_ID, API_HASH, BOT_TOKEN и ADMIN_IDS.", "Заповни API_ID, API_HASH, BOT_TOKEN та ADMIN_IDS."],
@@ -38,7 +49,6 @@ try {
     ["Или просто ПЕРЕШЛИ сюда любое сообщение из нужного канала/группы.", "Або просто ПЕРЕШЛИ сюди будь-яке повідомлення з потрібного каналу або групи."],
     ["Создать: 1 2", "Створити: 1 2"],
     ["Удалить: /unlink ID", "Видалити: /unlink ID"],
-    ["Формат: /unlink 3", "Формат: /unlink 3"],
     ["Связка создана.", "Зв’язок створено."],
     ["Связка ", "Зв’язок "],
     [" удалена.", " видалено."],
@@ -61,7 +71,6 @@ try {
     ["Чёрный фильтр очищен.", "Чорний фільтр очищено."],
     ["Замена добавлена.", "Заміну додано."],
     ["Замены очищены.", "Заміни очищено."],
-    ["Формат: 1 2", "Формат: 1 2"],
     ["Источник не найден.", "Джерело не знайдено."],
     ["Приёмник не найден.", "Приймач не знайдено."],
     ["📊 Статистика\n\n📥 Источников:", "📊 Статистика\n\n📥 Джерел:"],
@@ -73,79 +82,108 @@ try {
     ["/session — получить MT_SESSION для Hostinger", "/session — отримати MT_SESSION для Hostinger"],
     ["Источник добавлен.", "Джерело додано."],
     ["Приёмник добавлен.", "Приймач додано."],
-    ["Формат: /replace старое -> новое", "Формат: /replace старе -> нове"]
+    ["Формат: /replace старое -> новое", "Формат: /replace старе -> нове"],
+    ["Формат: /delay 5", "Формат: /delay 5"],
+    ["Формат: /signature Текст", "Формат: /signature Текст"]
   ];
 
-  function translate(value) {
-    if (typeof value !== "string") return value;
+  const ukToRu = new Map(replacements.map(([ru, uk]) => [uk, ru]));
+
+  function translate(value, lang) {
+    if (typeof value !== "string" || lang === "ru") return value;
     let result = value;
-    for (const [from, to] of replacements) {
-      result = result.split(from).join(to);
-    }
+    for (const [from, to] of replacements) result = result.split(from).join(to);
     return result;
   }
 
-  function translateExtra(extra) {
-    if (!extra || typeof extra !== "object") return extra;
-    if (!extra.reply_markup) return extra;
-
+  function translateExtra(extra, lang) {
+    if (!extra || typeof extra !== "object" || !extra.reply_markup) return extra;
     const copy = { ...extra };
     const markup = extra.reply_markup;
-
     if (Array.isArray(markup.keyboard)) {
-      copy.reply_markup = {
-        ...markup,
-        keyboard: markup.keyboard.map(row =>
-          row.map(button =>
-            typeof button === "string"
-              ? translate(button)
-              : button
-          )
-        )
-      };
+      let keyboard = markup.keyboard.map(row => row.map(button =>
+        typeof button === "string" ? translate(button, lang) : button
+      ));
+      const languageButton = "🌐 Мова / Язык";
+      if (!keyboard.some(row => row.some(button => button === languageButton || button === "🌐 Мова" || button === "🌐 Язык"))) {
+        keyboard.push([languageButton]);
+      }
+      copy.reply_markup = { ...markup, keyboard };
     }
-
     return copy;
   }
 
   if (Context?.prototype?.reply) {
     const originalReply = Context.prototype.reply;
     Context.prototype.reply = function (text, extra) {
-      return originalReply.call(
-        this,
-        translate(text),
-        translateExtra(extra)
-      );
+      const lang = getLang(this.from?.id);
+      return originalReply.call(this, translate(text, lang), translateExtra(extra, lang));
     };
   }
 
-  if (Markup?.keyboard) {
-    const originalKeyboard = Markup.keyboard;
-    Markup.keyboard = function (keyboard, ...args) {
-      const translated = Array.isArray(keyboard)
-        ? keyboard.map(row =>
-            Array.isArray(row)
-              ? row.map(button =>
-                  typeof button === "string"
-                    ? translate(button)
-                    : button
-                )
-              : row
-          )
-        : keyboard;
+  const normalizeIncomingText = ctx => {
+    const text = ctx?.message?.text;
+    if (!text || typeof text !== "string") return text;
+    const lang = getLang(ctx.from?.id);
+    if (lang !== "uk") return text;
+    if (ukToRu.has(text)) {
+      ctx.message.text = ukToRu.get(text);
+      return ctx.message.text;
+    }
+    const direct = {
+      "📥 Джерела": "📥 Источники",
+      "📤 Приймачі": "📤 Приёмники",
+      "🔗 Зв’язки": "🔗 Связки",
+      "⚙️ Налаштування": "⚙️ Настройки",
+      "📊 Статистика": "📊 Статистика",
+      "❓ Допомога": "❓ Помощь"
+    };
+    if (direct[text]) ctx.message.text = direct[text];
+    return ctx.message.text;
+  };
 
-      return originalKeyboard.call(
-        this,
-        translated,
-        ...args
-      );
+  const languageButton = "🌐 Мова / Язык";
+  const ukButton = "🇺🇦 Українська";
+  const ruButton = "🇷🇺 Русский";
+  const backButton = "↩️ Назад";
+
+  function languageKeyboard() {
+    return Markup.keyboard([[ukButton, ruButton], [backButton]]).resize().persistent();
+  }
+
+  if (Composer?.prototype?.use) {
+    const originalUse = Composer.prototype.use;
+    Composer.prototype.use = function (...middlewares) {
+      if (!this.__languageMiddlewareInstalled) {
+        this.__languageMiddlewareInstalled = true;
+        const languageMiddleware = async (ctx, next) => {
+          if (!ctx.from || !isAdmin(ctx.from.id)) return next();
+          const text = ctx.message?.text;
+          if (text === languageButton || text === "🌐 Мова" || text === "🌐 Язык") {
+            const lang = getLang(ctx.from.id);
+            return ctx.reply(lang === "uk" ? "🌐 Оберіть мову:" : "🌐 Выберите язык:", languageKeyboard());
+          }
+          if (text === ukButton) {
+            setLang(ctx.from.id, "uk");
+            return ctx.reply("✅ Мову змінено на українську.");
+          }
+          if (text === ruButton) {
+            setLang(ctx.from.id, "ru");
+            return ctx.reply("✅ Язык изменён на русский.");
+          }
+          if (text === backButton) {
+            return ctx.reply(getLang(ctx.from.id) === "uk" ? "↩️ Головне меню." : "↩️ Главное меню.");
+          }
+          normalizeIncomingText(ctx);
+          return next();
+        };
+        return originalUse.call(this, languageMiddleware, ...middlewares);
+      }
+      return originalUse.apply(this, middlewares);
     };
   }
 
-  console.log("Ukrainian Telegram UI translation layer loaded.");
+  console.log("Language switcher loaded: Ukrainian default, Russian available.");
 } catch (e) {
-  console.error(
-    "Ukrainian UI translation layer error:",
-    e?.message || e
-  );
+  console.error("Language switcher error:", e?.message || e);
 }
