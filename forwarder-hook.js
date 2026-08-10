@@ -1,5 +1,6 @@
 // Stable MTProto polling forwarder.
-// It starts from TelegramClient.connect(), so it does not depend on update events.
+// Uses direct message-ID lookup instead of GramJS history iterators.
+// This avoids the "Request not set yet" failure seen with getMessages({minId,maxId}).
 const fs = require("fs");
 const path = require("path");
 const Database = require("better-sqlite3");
@@ -9,6 +10,7 @@ const nodeProcess = globalThis.process;
 const persistentDir = path.join(nodeProcess?.env?.HOME || nodeProcess?.cwd?.() || ".", ".telegram-post-cloner");
 const dbPath = nodeProcess?.env?.DB_PATH || path.join(persistentDir, "cloner.db");
 fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+
 const db = new Database(dbPath);
 db.exec(`
 CREATE TABLE IF NOT EXISTS sources(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER UNIQUE NOT NULL,title TEXT NOT NULL,username TEXT);
@@ -17,30 +19,244 @@ CREATE TABLE IF NOT EXISTS links(id INTEGER PRIMARY KEY AUTOINCREMENT,source_id 
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS copied(source_chat_id INTEGER NOT NULL,source_message_id INTEGER NOT NULL,destination_chat_id INTEGER NOT NULL,destination_message_id INTEGER,created_at DATETIME DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(source_chat_id,source_message_id,destination_chat_id));
 `);
-const settingStmt=db.prepare("SELECT value FROM settings WHERE key=?");
-const sourceRows=db.prepare("SELECT chat_id,title,username FROM sources ORDER BY id");
-const destinationsFor=db.prepare(`SELECT d.chat_id FROM links l JOIN sources s ON s.id=l.source_id JOIN destinations d ON d.id=l.destination_id WHERE s.chat_id=? ORDER BY d.id`);
-const copiedStmt=db.prepare("SELECT 1 FROM copied WHERE source_chat_id=? AND source_message_id=? AND destination_chat_id=?");
-const markStmt=db.prepare("INSERT OR IGNORE INTO copied(source_chat_id,source_message_id,destination_chat_id,destination_message_id) VALUES(?,?,?,?)");
-const locks=new Map();const lastSeen=new Map();const running=new WeakSet();
-function setting(k,d=""){const r=settingStmt.get(k);return r?r.value:d;}
-function idOf(v){if(v===null||v===undefined)return 0;if(typeof v==="bigint")return Number(v);if(typeof v==="number")return v;if(typeof v==="string")return Number(v)||0;if(v.value!==undefined)return Number(v.value)||0;return Number(v)||0;}
-function csv(v){return String(v||"").split(",").map(x=>x.trim()).filter(Boolean);}
-function transformText(text){text=text||"";const lower=text.toLowerCase();if(csv(setting("ban_words")).some(w=>lower.includes(w.toLowerCase())))return null;const keys=csv(setting("keywords"));if(keys.length&&!keys.some(w=>lower.includes(w.toLowerCase())))return null;if(setting("remove_links","0")==="1")text=text.replace(/https?:\/\/\S+|(?:https?:\/\/)?t\.me\/\S+/gi,"");for(const line of setting("replacements","").split(/\r?\n/)){if(!line.includes("->"))continue;const p=line.indexOf("->"),a=line.slice(0,p).trim(),b=line.slice(p+2).trim();if(a)text=text.split(a).join(b);}const sig=setting("signature","");if(sig)text=text.trim()?`${text.trim()}\n\n${sig}`:sig;return text.trim();}
-async function withLock(id,task){const prev=locks.get(id)||Promise.resolve();let release;const cur=new Promise(r=>release=r);locks.set(id,cur);await prev;try{return await task();}finally{release();if(locks.get(id)===cur)locks.delete(id);}}
-async function copyMessage(client,m,destination){const text=transformText(m.message||"");if(text===null)return null;if(m.media)return client.sendFile(destination,{file:m.media,caption:text||undefined,forceDocument:false});if(!text)return null;return client.sendMessage(destination,{message:text,linkPreview:false});}
-async function processOne(client,sourceId,m){const rows=destinationsFor.all(sourceId);console.log(`FORWARDER: source=${sourceId} message=${idOf(m.id)} destinations=${rows.length}`);for(const row of rows){const dest=idOf(row.chat_id);if(!dest||copiedStmt.get(sourceId,idOf(m.id),dest))continue;await withLock(dest,async()=>{try{const entity=await client.getEntity(dest);const sent=await copyMessage(client,m,entity);if(!sent){console.log(`FORWARDER: filtered/empty ${sourceId}:${idOf(m.id)}`);return;}markStmt.run(sourceId,idOf(m.id),dest,idOf(sent.id));console.log(`FORWARDER COPIED ${sourceId}:${idOf(m.id)} -> ${dest}`);}catch(e){console.error(`FORWARDER COPY ERROR ${sourceId} -> ${dest}:`,e?.stack||e?.message||e);}});}}
-async function pollSource(client,row){const sourceId=idOf(row.chat_id);const ref=row.username?`@${row.username}`:sourceId;try{const entity=await client.getEntity(ref);const newest=await client.getMessages(entity,{limit:1});if(!newest?.length)return;const newestId=idOf(newest[0].id);const previous=lastSeen.get(sourceId);if(previous===undefined){lastSeen.set(sourceId,newestId);console.log(`FORWARDER: watching ${sourceId} (${row.title}), last=${newestId}`);return;}if(newestId<=previous)return;const messages=await client.getMessages(entity,{minId:previous,maxId:newestId,limit:Math.min(100,Math.max(1,newestId-previous))});const fresh=(messages||[]).filter(m=>idOf(m.id)>previous&&idOf(m.id)<=newestId).sort((a,b)=>idOf(a.id)-idOf(b.id));lastSeen.set(sourceId,newestId);console.log(`FORWARDER: found ${fresh.length} new message(s) in ${sourceId}`);for(const m of fresh)await processOne(client,sourceId,m);}catch(e){console.error(`FORWARDER POLL ERROR ${sourceId}:`,e?.stack||e?.message||e);}}
-async function start(client){if(!client||running.has(client))return;running.add(client);console.log("FORWARDER: Telegram client ready; polling every 2 seconds.");const loop=async()=>{try{const rows=sourceRows.all();console.log(`FORWARDER: sources=${rows.length}`);for(const row of rows)await pollSource(client,row);}catch(e){console.error("FORWARDER LOOP ERROR:",e?.stack||e?.message||e);}setTimeout(loop,2000);};await loop();}
 
-if(!TelegramClient.prototype.__postClonerConnectHook){
-  const originalConnect=TelegramClient.prototype.connect;
-  TelegramClient.prototype.connect=async function(...args){
-    const result=await originalConnect.apply(this,args);
+const settingStmt = db.prepare("SELECT value FROM settings WHERE key=?");
+const sourceRows = db.prepare("SELECT chat_id,title,username FROM sources ORDER BY id");
+const destinationsFor = db.prepare(`
+  SELECT d.chat_id
+  FROM links l
+  JOIN sources s ON s.id=l.source_id
+  JOIN destinations d ON d.id=l.destination_id
+  WHERE s.chat_id=?
+  ORDER BY d.id
+`);
+const copiedStmt = db.prepare("SELECT 1 FROM copied WHERE source_chat_id=? AND source_message_id=? AND destination_chat_id=?");
+const markStmt = db.prepare(`
+  INSERT OR IGNORE INTO copied(source_chat_id,source_message_id,destination_chat_id,destination_message_id)
+  VALUES(?,?,?,?)
+`);
+
+const locks = new Map();
+const lastSeen = new Map();
+const running = new WeakSet();
+
+function setting(key, fallback = "") {
+  const row = settingStmt.get(key);
+  return row ? row.value : fallback;
+}
+
+function idOf(value) {
+  if (value === null || value === undefined) return 0;
+  if (typeof value === "bigint") return Number(value);
+  if (typeof value === "number") return value;
+  if (typeof value === "string") return Number(value) || 0;
+  if (value?.value !== undefined) return Number(value.value) || 0;
+  return Number(value) || 0;
+}
+
+function csv(value) {
+  return String(value || "")
+    .split(",")
+    .map(x => x.trim())
+    .filter(Boolean);
+}
+
+function transformText(text) {
+  text = text || "";
+  const lower = text.toLowerCase();
+
+  if (csv(setting("ban_words")).some(word => lower.includes(word.toLowerCase()))) {
+    return null;
+  }
+
+  const keywords = csv(setting("keywords"));
+  if (keywords.length && !keywords.some(word => lower.includes(word.toLowerCase()))) {
+    return null;
+  }
+
+  if (setting("remove_links", "0") === "1") {
+    text = text.replace(/https?:\/\/\S+|(?:https?:\/\/)?t\.me\/\S+/gi, "");
+  }
+
+  for (const line of setting("replacements", "").split(/\r?\n/)) {
+    if (!line.includes("->")) continue;
+    const p = line.indexOf("->");
+    const oldText = line.slice(0, p).trim();
+    const newText = line.slice(p + 2).trim();
+    if (oldText) text = text.split(oldText).join(newText);
+  }
+
+  const signature = setting("signature", "");
+  if (signature) {
+    text = text.trim() ? `${text.trim()}\n\n${signature}` : signature;
+  }
+
+  return text.trim();
+}
+
+async function withLock(destinationId, task) {
+  const previous = locks.get(destinationId) || Promise.resolve();
+  let release;
+  const current = new Promise(resolve => { release = resolve; });
+  locks.set(destinationId, current);
+
+  await previous;
+  try {
+    return await task();
+  } finally {
+    release();
+    if (locks.get(destinationId) === current) locks.delete(destinationId);
+  }
+}
+
+async function copyMessage(client, message, destination) {
+  const text = transformText(message.message || "");
+  if (text === null) return null;
+
+  if (message.media) {
+    return client.sendFile(destination, {
+      file: message.media,
+      caption: text || undefined,
+      forceDocument: false
+    });
+  }
+
+  if (!text) return null;
+  return client.sendMessage(destination, {
+    message: text,
+    linkPreview: false
+  });
+}
+
+async function processOne(client, sourceId, message) {
+  const messageId = idOf(message.id);
+  const rows = destinationsFor.all(sourceId);
+
+  console.log(`FORWARDER: source=${sourceId} message=${messageId} destinations=${rows.length}`);
+
+  for (const row of rows) {
+    const destinationId = idOf(row.chat_id);
+    if (!destinationId) continue;
+    if (copiedStmt.get(sourceId, messageId, destinationId)) continue;
+
+    await withLock(destinationId, async () => {
+      try {
+        const destination = await client.getEntity(destinationId);
+        const sent = await copyMessage(client, message, destination);
+
+        if (!sent) {
+          console.log(`FORWARDER: filtered/empty ${sourceId}:${messageId}`);
+          return;
+        }
+
+        markStmt.run(sourceId, messageId, destinationId, idOf(sent.id));
+        console.log(`FORWARDER COPIED ${sourceId}:${messageId} -> ${destinationId}`);
+      } catch (error) {
+        console.error(
+          `FORWARDER COPY ERROR ${sourceId} -> ${destinationId}:`,
+          error?.stack || error?.message || error
+        );
+      }
+    });
+  }
+}
+
+async function fetchMessageBatch(client, entity, firstId, lastId) {
+  const ids = [];
+  for (let id = firstId; id <= lastId; id++) ids.push(id);
+
+  // GramJS direct ID lookup uses messages.getMessages/channels.getMessages
+  // and does not create the history iterator that caused the startup error.
+  const result = await client.getMessages(entity, { ids });
+  return Array.from(result || [])
+    .filter(message => message && idOf(message.id) >= firstId && idOf(message.id) <= lastId)
+    .sort((a, b) => idOf(a.id) - idOf(b.id));
+}
+
+async function pollSource(client, row) {
+  const sourceId = idOf(row.chat_id);
+  const ref = row.username ? `@${row.username}` : sourceId;
+
+  try {
+    const entity = await client.getEntity(ref);
+    const newest = await client.getMessages(entity, { limit: 1 });
+    if (!newest?.length) return;
+
+    const newestId = idOf(newest[0].id);
+    const previousId = lastSeen.get(sourceId);
+
+    if (previousId === undefined) {
+      lastSeen.set(sourceId, newestId);
+      console.log(`FORWARDER: watching ${sourceId} (${row.title}), last=${newestId}`);
+      return;
+    }
+
+    if (newestId <= previousId) return;
+
+    // Process at most 100 message IDs per polling pass.
+    // If more than 100 messages arrived, lastSeen advances only to the
+    // processed boundary so nothing is silently skipped.
+    const batchEnd = Math.min(newestId, previousId + 100);
+    const fresh = await fetchMessageBatch(client, entity, previousId + 1, batchEnd);
+
+    lastSeen.set(sourceId, batchEnd);
+
+    console.log(`FORWARDER: found ${fresh.length} new message(s) in ${sourceId}`);
+
+    for (const message of fresh) {
+      await processOne(client, sourceId, message);
+    }
+  } catch (error) {
+    console.error(
+      `FORWARDER POLL ERROR ${sourceId}:`,
+      error?.stack || error?.message || error
+    );
+  }
+}
+
+async function start(client) {
+  if (!client || running.has(client)) return;
+  running.add(client);
+
+  console.log("FORWARDER: Telegram client ready; polling every 2 seconds.");
+
+  const loop = async () => {
+    try {
+      const rows = sourceRows.all();
+      for (const row of rows) {
+        await pollSource(client, row);
+      }
+    } catch (error) {
+      console.error(
+        "FORWARDER LOOP ERROR:",
+        error?.stack || error?.message || error
+      );
+    }
+
+    setTimeout(loop, 2000);
+  };
+
+  await loop();
+}
+
+if (!TelegramClient.prototype.__postClonerConnectHook) {
+  const originalConnect = TelegramClient.prototype.connect;
+
+  TelegramClient.prototype.connect = async function(...args) {
+    const result = await originalConnect.apply(this, args);
     console.log("FORWARDER: Telegram connect() completed; starting poller.");
-    setImmediate(()=>start(this).catch(e=>console.error("FORWARDER START ERROR:",e?.stack||e?.message||e)));
+    setImmediate(() => {
+      start(this).catch(error => {
+        console.error(
+          "FORWARDER START ERROR:",
+          error?.stack || error?.message || error
+        );
+      });
+    });
     return result;
   };
-  TelegramClient.prototype.__postClonerConnectHook=true;
+
+  TelegramClient.prototype.__postClonerConnectHook = true;
 }
+
 console.log("Stable MTProto forwarder hook loaded.");
