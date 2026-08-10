@@ -2,6 +2,19 @@
 // The application uses `const { TelegramClient, events } = require("telegram")`,
 // while GramJS exposes event builders from `telegram/events`.
 const Module = require("module");
+const path = require("path");
+const fs = require("fs");
+
+// Hostinger creates a new version directory on each deployment.
+// Keep the SQLite database (and therefore the saved MTProto session)
+// outside the version directory so redeployments do not log the account out.
+if (!process.env.DB_PATH) {
+  const base = process.env.HOME || process.cwd();
+  const dir = path.join(base, ".telegram-post-cloner");
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
+  process.env.DB_PATH = path.join(dir, "cloner.db");
+}
+
 const originalLoad = Module._load;
 
 Module._load = function(request, parent, isMain) {
@@ -10,7 +23,6 @@ Module._load = function(request, parent, isMain) {
   if (request === "telegram" && mod && !mod.events) {
     const eventModule = originalLoad.call(this, "telegram/events", parent, isMain);
 
-    // Normal CommonJS export object.
     try {
       Object.defineProperty(mod, "events", {
         value: eventModule,
@@ -19,11 +31,8 @@ Module._load = function(request, parent, isMain) {
         writable: true,
       });
       return mod;
-    } catch (_) {
-      // Some package builds may expose a non-extensible export object.
-    }
+    } catch (_) {}
 
-    // Fallback: return a proxy that exposes the missing `events` property.
     return new Proxy(mod, {
       get(target, prop, receiver) {
         if (prop === "events") return eventModule;
