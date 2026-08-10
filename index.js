@@ -1,6 +1,6 @@
 // Direct entrypoint.
-// Keep startup minimal: the core already contains the bot handlers.
-// The extra link runtime monkey-patched Telegraf and could prevent handlers from working.
+// Startup helpers are loaded before core so the stable core remains unchanged.
 require("./startup-fix.js");
 require("./language.js");
+require("./link-settings-live.js");
 require("./core.js");
