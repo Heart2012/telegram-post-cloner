@@ -4,4 +4,5 @@ require("./startup-fix.js");
 require("./language.js");
 require("./link-settings.js");
 require("./link-runtime.js");
+require("./force-link-ui.js");
 require("./core.js");
