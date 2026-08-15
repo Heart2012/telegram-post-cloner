@@ -46,12 +46,13 @@ BOT TOKEN: @BotFather
 ❓ Помощь
 
 Команды:
-`/start`, `/cancel`, `/id`, `/unlink 3`,
-`/links_on`, `/links_off`,
-`/delay 5`, `/delay_clear`,
-`/signature Текст`, `/signature_clear`,
-`/keywords слово1, слово2`, `/keywords_clear`,
-`/ban_words слово1, слово2`, `/ban_words_clear`,
-`/replace старое -> новое`, `/replace_clear`
+`/start` — открыть панель управления.
+`/auth` — подключить Telegram-аккаунт через MTProto.
+`/add_source @channel` или `/add_source -1001234567890` — добавить источник.
+`/add_destination @channel` или `/add_destination -1001234567890` — добавить приёмник.
+`/clone_ids LINK_ID 10,12,15-20` — вручную скопировать посты связки по номерам сообщений.
+`/clone_dates LINK_ID 2026-08-01 2026-08-15 [limit]` — вручную скопировать посты связки за период.
+
+Настройки связки доступны из меню `🔗 Связки`: включение/выключение, удаление ссылок, задержка, ключевые слова, бан-слова, подпись и замены.
 
 Важно: обычный Web Hosting должен держать Node.js процесс постоянно. Если Hostinger останавливает долгоживущие процессы, потребуется VPS.
